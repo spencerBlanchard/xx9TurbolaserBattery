@@ -62,6 +62,7 @@
 #include <freertos/task.h>
 #include <math.h>
 #include "background_bitmap.h"
+#include "start_menu_background_bitmap.h"
 
 
 // Set to 1 only while debugging. Keeping this at 0 removes
@@ -82,8 +83,8 @@
 // JOYSTICK PINS
 // ============================================================
 
-#define PIN_UP     27
-#define PIN_DOWN   26
+#define PIN_UP     26
+#define PIN_DOWN   27
 #define PIN_LEFT   14
 #define PIN_RIGHT  13
 
@@ -196,9 +197,9 @@ const uint8_t LR_SERVO_CHANNEL = 2;
 //   down  = 350
 // ============================================================
 
-const uint16_t LR_LEFT_TICKS  = 353;
-const uint16_t LR_STOP_TICKS  = 373;
-const uint16_t LR_RIGHT_TICKS = 383;
+const uint16_t LR_LEFT_TICKS  = 351;
+const uint16_t LR_STOP_TICKS  = 371;
+const uint16_t LR_RIGHT_TICKS = 381;
 
 const uint16_t UD_UP_TICKS    = 380;
 const uint16_t UD_STOP_TICKS  = 370;
@@ -237,6 +238,34 @@ int8_t lrPreviousMoveDirection = 0;
 
 unsigned long lrLastTravelUpdateMs = 0;
 
+// ============================================================
+// UP / DOWN DIGITAL TRAVEL LIMIT
+// ============================================================
+// The turret is assumed to be physically centered vertically when the
+// game starts. We track vertical position only by how long the continuous-
+// rotation servo has actually been commanded to move.
+//
+// Center = 0 ms
+// Full up limit   = -1500 ms from center
+// Full down limit = +1500 ms from center
+//
+// This makes the complete physical top-to-bottom command-time sweep
+// exactly 6.0 seconds, matching the TFT elevation marker.
+// ============================================================
+
+const int32_t UD_TRAVEL_LIMIT_MS = 1100;
+
+// Signed estimated vertical position, expressed as equivalent
+// milliseconds of servo travel from the startup center position.
+// Negative = up, positive = down.
+int32_t udTravelPositionMs = 0;
+
+// Direction actually commanded during the interval since the previous
+// update: -1 = up, 0 = stopped, +1 = down.
+int8_t udPreviousMoveDirection = 0;
+
+unsigned long udLastTravelUpdateMs = 0;
+
 // Conservative SG90 pulse range at 50 Hz.
 // If the servo mechanically binds near either endpoint, reduce
 // SERVO_MAX_PULSE or increase SERVO_MIN_PULSE.
@@ -265,6 +294,10 @@ ServoAnimationState servoAnimationState = SERVO_ANIM_IDLE;
 unsigned long servoAnimationStateStart = 0;
 float servoCurrentAngle = SERVO_REST_ANGLE;
 float servoPreloadStartAngle = SERVO_REST_ANGLE;
+
+// Red-button recoil plays at half speed (2x duration).
+// Green-button recoil uses the normal timing.
+float servoAnimationTimeScale = 1.0f;
 
 
 // ============================================================
@@ -441,15 +474,38 @@ const float ENEMY_X_WIGGLE_AMPLITUDE = 30.0;
 const float ENEMY_X_WIGGLE_FREQUENCY = 0.10;
 
 
-// Enemy center path
-const float ENEMY_START_X =
-  (RECT_LEFT + RECT_RIGHT) / 2.0;
+// Enemy route system. Each new ship advances to the next route:
+//   0 = top middle  -> bottom middle
+//   1 = top left    -> bottom right
+//   2 = top right   -> bottom left
+//   3 = middle left -> middle right
+//   4 = middle right-> middle left
+const uint8_t ENEMY_PATH_COUNT = 5;
+uint8_t enemyPathIndex = 0;
 
+// The original vertical route crossed the play area at 12 px/sec.
+// Use that same total travel time for every route so each pattern has
+// a consistent gameplay duration, regardless of route length.
+const float ENEMY_PATH_DURATION_SECONDS =
+  ((RECT_BOTTOM - ENEMY_HEIGHT / 2 - 2)
+   - (RECT_TOP + ENEMY_HEIGHT / 2 + 2))
+  / ENEMY_DESCENT_SPEED;
 
-// Enemy vertical position
-float enemyBaseY =
-  RECT_TOP + ENEMY_HEIGHT / 2 + 2;
+// Each new ship moves 7% faster along its start-to-end route than the
+// previous ship. This only affects route traversal; wiggle timing is unchanged.
+const float ENEMY_SPEED_INCREASE_PER_SHIP = 0.07f;
 
+// Red-phase enemies move slightly slower while red. Once a red enemy is hit
+// and turns green, it immediately resumes the normal speed for its ship number.
+const float RED_ENEMY_SPEED_MULTIPLIER = 0.95f;
+
+float enemyPathProgress = 0.0f;
+
+// Route endpoints for the current ship.
+float enemyStartX = 0.0f;
+float enemyStartY = 0.0f;
+float enemyEndX   = 0.0f;
+float enemyEndY   = 0.0f;
 
 // Actual screen position
 int enemyX;
@@ -463,14 +519,25 @@ int enemyY;
 const int ENEMY_HEIGHT_LINE_THICKNESS = 9;
 
 
-// Base enemy elevation
-const float ENEMY_ELEVATION_CENTER =
-  (TICK_Y_MIN + TICK_Y_MAX) / 2.0;
+// Enemy elevation target center. This is randomized for each NEW ship.
+// The random center is kept far enough from the edges that the full wiggle
+// can still happen without ever leaving the legal elevation range.
+float enemyElevationCenterY =
+  (TICK_Y_MIN + TICK_Y_MAX) / 2.0f;
 
 
-// Elevation wiggle
-const float ENEMY_ELEVATION_WIGGLE_AMPLITUDE = 40.0;
-const float ENEMY_ELEVATION_WIGGLE_FREQUENCY = 0.03;
+// Elevation wiggle by enemy color.
+// Green ships move more aggressively vertically.
+// Red ships use a smaller/slower vertical wiggle.
+const float GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE = 90.0f;
+const float GREEN_ENEMY_ELEVATION_WIGGLE_FREQUENCY = 0.04f;
+
+const float RED_ENEMY_ELEVATION_WIGGLE_AMPLITUDE = 50.0f;
+const float RED_ENEMY_ELEVATION_WIGGLE_FREQUENCY = 0.03f;
+
+// Give every new ship a different wiggle starting phase as well, so the
+// elevation target does not always enter with the same motion pattern.
+float enemyElevationPhaseOffset = 0.0f;
 
 
 int enemyElevationY;
@@ -480,7 +547,21 @@ int enemyElevationY;
 // COLORS
 // ============================================================
 
-const uint16_t ENEMY_COLOR = ILI9341_GREEN;
+const uint16_t ENEMY_GREEN_COLOR = ILI9341_GREEN;
+const uint16_t ENEMY_RED_COLOR   = ILI9341_RED;
+
+// Every spawned ship gets a 1-based number.
+// Ships 1, 2, and 4 start green. Ship 3, ship 5, and every ship after 5 start red.
+uint32_t enemyShipNumber = 1;
+bool enemyIsRed = false;
+
+uint16_t currentEnemyColor() {
+  return enemyIsRed ? ENEMY_RED_COLOR : ENEMY_GREEN_COLOR;
+}
+
+void setEnemyColorForShipNumber() {
+  enemyIsRed = (enemyShipNumber == 3 || enemyShipNumber >= 5);
+}
 
 
 // ============================================================
@@ -508,10 +589,23 @@ const int SCORE_BOX_H = 13;
 
 // A shot counts when BOTH targeting dimensions are close enough:
 //   1) the white aim line passes close to the ship's X position
-//   2) the white elevation tick is close to the green elevation marker
-// Adjust these two values later if you want hits tighter/looser.
-const int HIT_X_THRESHOLD_PX = 7;
-const int HIT_Y_THRESHOLD_PX = 10;
+//   2) the white elevation tick is close to the enemy elevation marker
+//
+// Difficulty is selected from the joystick-controlled start menu.
+// NORMAL is selected by default and uses the tighter 7 px threshold.
+// EASY uses the more forgiving 10 px threshold.
+const int NORMAL_HIT_THRESHOLD_PX = 7;
+const int EASY_HIT_THRESHOLD_PX   = 10;
+
+enum GameDifficulty {
+  DIFFICULTY_NORMAL,
+  DIFFICULTY_EASY
+};
+
+GameDifficulty selectedDifficulty = DIFFICULTY_NORMAL;
+
+int hitXThresholdPx = NORMAL_HIT_THRESHOLD_PX;
+int hitYThresholdPx = NORMAL_HIT_THRESHOLD_PX;
 
 // Quick two-flicker hit animation. Enemy movement pauses during it.
 const unsigned long HIT_FLICKER_INTERVAL_MS = 70;
@@ -521,6 +615,10 @@ bool enemyHitAnimating = false;
 bool enemyVisibleDuringHit = true;
 unsigned long enemyHitLastToggleMs = 0;
 int enemyHitTransitionCount = 0;
+
+// false: normal green hit -> destroy + respawn
+// true: red hit -> flicker, then turn green and continue same route
+bool enemyHitTurnsGreen = false;
 
 
 // Thin red bar at bottom
@@ -692,7 +790,9 @@ void setAnimationServoAngle(float angle) {
 }
 
 
-void triggerServoAnimation() {
+void triggerServoAnimation(float timeScale = 1.0f) {
+
+  servoAnimationTimeScale = max(0.1f, timeScale);
 
   // Turn the standalone animation LED on immediately.
   digitalWrite(
@@ -745,7 +845,7 @@ void updateServoAnimation() {
 
     float t =
       (float)elapsed /
-      (float)SERVO_PRELOAD_MS;
+      ((float)SERVO_PRELOAD_MS * servoAnimationTimeScale);
 
     if (t >= 1.0f) {
 
@@ -787,7 +887,7 @@ void updateServoAnimation() {
   // ----------------------------------------------------------
   if (servoAnimationState == SERVO_ANIM_KICK_HOLD) {
 
-    if (elapsed >= SERVO_KICK_HOLD_MS) {
+    if (elapsed >= (unsigned long)(SERVO_KICK_HOLD_MS * servoAnimationTimeScale)) {
 
       servoAnimationState =
         SERVO_ANIM_RETURN;
@@ -807,7 +907,7 @@ void updateServoAnimation() {
 
     float t =
       (float)elapsed /
-      (float)SERVO_RETURN_MS;
+      ((float)SERVO_RETURN_MS * servoAnimationTimeScale);
 
     if (t >= 1.0f) {
 
@@ -974,28 +1074,78 @@ void updateJoystickServos(
 
   // ----------------------------------------------------------
   // UP / DOWN - PCA9685 channel 1
+  // DIGITAL TIME-BASED TRAVEL LIMITS
   // ----------------------------------------------------------
+  // This mirrors the left/right limiter. The program assumes the turret
+  // begins vertically centered, then estimates position from elapsed time
+  // while the servo is actually being commanded to move.
+
+  unsigned long udNowMs = millis();
+
+  if (udLastTravelUpdateMs == 0) {
+    udLastTravelUpdateMs = udNowMs;
+  }
+
+  unsigned long udElapsedMs =
+    udNowMs - udLastTravelUpdateMs;
+
+  udLastTravelUpdateMs = udNowMs;
+
+  if (udPreviousMoveDirection < 0) {
+    udTravelPositionMs -= (int32_t)udElapsedMs;
+  }
+  else if (udPreviousMoveDirection > 0) {
+    udTravelPositionMs += (int32_t)udElapsedMs;
+  }
+
+  udTravelPositionMs = constrain(
+    udTravelPositionMs,
+    -UD_TRAVEL_LIMIT_MS,
+    UD_TRAVEL_LIMIT_MS
+  );
+
+  int8_t requestedUDDirection = 0;
 
   if (up && !down) {
+    requestedUDDirection = -1;
+  }
+  else if (down && !up) {
+    requestedUDDirection = 1;
+  }
 
+  // Stop if the joystick is trying to move farther past an end limit.
+  // Moving back toward center/opposite end remains immediately available.
+  if (
+    requestedUDDirection < 0 &&
+    udTravelPositionMs <= -UD_TRAVEL_LIMIT_MS
+  ) {
+    requestedUDDirection = 0;
+  }
+
+  if (
+    requestedUDDirection > 0 &&
+    udTravelPositionMs >= UD_TRAVEL_LIMIT_MS
+  ) {
+    requestedUDDirection = 0;
+  }
+
+  if (requestedUDDirection < 0) {
     setUDServoTicks(
       UD_UP_TICKS
     );
   }
-  else if (down && !up) {
-
+  else if (requestedUDDirection > 0) {
     setUDServoTicks(
       UD_DOWN_TICKS
     );
   }
   else {
-
-    // Releasing the joystick, or pressing both directions,
-    // always returns to the calibrated neutral.
     setUDServoTicks(
       UD_STOP_TICKS
     );
   }
+
+  udPreviousMoveDirection = requestedUDDirection;
 }
 
 
@@ -1579,6 +1729,45 @@ void restoreBackgroundRect(
 
 
 // ============================================================
+// RESTORE PART OF START MENU BACKGROUND BITMAP
+// ============================================================
+
+void restoreStartMenuBackgroundRect(
+  int x0,
+  int y0,
+  int x1,
+  int y1
+) {
+
+  x0 = max(0, x0);
+  y0 = max(0, y0);
+  x1 = min(START_MENU_BG_WIDTH - 1, x1);
+  y1 = min(START_MENU_BG_HEIGHT - 1, y1);
+
+  if (x1 < x0 || y1 < y0) {
+    return;
+  }
+
+  int w = x1 - x0 + 1;
+
+  for (int y = y0; y <= y1; y++) {
+    const uint16_t* rowPtr =
+      startMenuBackgroundBitmap
+      + y * START_MENU_BG_WIDTH
+      + x0;
+
+    tft.drawRGBBitmap(
+      x0,
+      y,
+      rowPtr,
+      w,
+      1
+    );
+  }
+}
+
+
+// ============================================================
 // DRAW PLAYER AIM LINE
 // ============================================================
 
@@ -1701,7 +1890,7 @@ void drawEnemyShip(
     x,
     bottomY,
 
-    ENEMY_COLOR
+    currentEnemyColor()
   );
 }
 
@@ -1726,7 +1915,7 @@ void drawEnemyElevation(int y) {
 
     ENEMY_HEIGHT_LINE_THICKNESS,
 
-    ENEMY_COLOR
+    currentEnemyColor()
   );
 }
 
@@ -1766,7 +1955,7 @@ void drawScoreBox() {
   }
 
   tft.setTextSize(1);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
 
   int16_t x1;
   int16_t y1;
@@ -1820,7 +2009,7 @@ bool shotHitsEnemy() {
 
   if (
     distanceAlongAimLine < 0.0f ||
-    distanceAlongAimLine > renderedAimLength + HIT_X_THRESHOLD_PX
+    distanceAlongAimLine > renderedAimLength + hitXThresholdPx
   ) {
     return false;
   }
@@ -1835,8 +2024,8 @@ bool shotHitsEnemy() {
     abs(tickY - enemyElevationY);
 
   return (
-    xError <= HIT_X_THRESHOLD_PX &&
-    yError <= HIT_Y_THRESHOLD_PX
+    xError <= hitXThresholdPx &&
+    yError <= hitYThresholdPx
   );
 }
 
@@ -1845,22 +2034,31 @@ bool shotHitsEnemy() {
 // BEGIN / UPDATE HIT FLICKER
 // ============================================================
 
-void beginEnemyHit() {
+void beginEnemyHit(bool turnsGreen) {
 
   if (enemyHitAnimating || gameOver) {
     return;
   }
 
-  score++;
-  drawScoreBox();
+  enemyHitTurnsGreen = turnsGreen;
+
+  // A red-phase hit only strips the red state. Score is awarded when
+  // the green ship is actually destroyed.
+  if (!enemyHitTurnsGreen) {
+    score++;
+    drawScoreBox();
+
+    Serial.print("HIT! Score = ");
+    Serial.println(score);
+  }
+  else {
+    Serial.println("RED HIT -> transitioning enemy to green");
+  }
 
   enemyHitAnimating = true;
   enemyVisibleDuringHit = false;
   enemyHitTransitionCount = 0;
   enemyHitLastToggleMs = millis();
-
-  Serial.print("HIT! Score = ");
-  Serial.println(score);
 }
 
 
@@ -1888,14 +2086,55 @@ bool updateEnemyHitAnimation() {
       HIT_FLICKER_TRANSITIONS
     ) {
 
-      // End invisible, then spawn the next ship at the top.
       enemyVisibleDuringHit = false;
       enemyHitAnimating = false;
 
+      if (enemyHitTurnsGreen) {
+        // Keep the same ship and route position, but change it to green.
+        enemyIsRed = false;
+        enemyHitTurnsGreen = false;
+
+        // Green ships have a larger vertical wiggle than red ships.
+        // Clamp this ship's randomized center into the GREEN-safe range so
+        // its full +/-90 px motion still stays inside the elevation bar.
+        {
+          const int elevationHalfThickness =
+            ENEMY_HEIGHT_LINE_THICKNESS / 2;
+
+          const int greenSafeMinY =
+            TICK_Y_MIN
+            + elevationHalfThickness
+            + (int)ceilf(GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE);
+
+          const int greenSafeMaxY =
+            TICK_Y_MAX
+            - elevationHalfThickness
+            - (int)ceilf(GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE);
+
+          if (greenSafeMaxY >= greenSafeMinY) {
+            enemyElevationCenterY =
+              constrain(
+                enemyElevationCenterY,
+                (float)greenSafeMinY,
+                (float)greenSafeMaxY
+              );
+          }
+          else {
+            enemyElevationCenterY =
+              (TICK_Y_MIN + TICK_Y_MAX) / 2.0f;
+          }
+        }
+
+        // Freeze compensation: resume from the same path position rather
+        // than jumping ahead by the flicker duration.
+        previousEnemyUpdate = millis();
+
+        return true;
+      }
+
+      // Normal green hit: remove this ship and spawn the next route/ship.
       resetEnemy();
 
-      // Reset update timing so the new ship does not jump down by
-      // the amount of time spent flickering.
       previousEnemyUpdate = millis();
 
       return true;
@@ -2021,7 +2260,7 @@ void showGameOver() {
   );
 
   tft.setTextSize(2);
-  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setTextColor(ILI9341_WHITE);
 
   tft.getTextBounds(
     scoreLine,
@@ -2085,159 +2324,262 @@ void loseHealth() {
 
 bool updateEnemyPosition() {
 
-  unsigned long now =
-    millis();
-
+  unsigned long now = millis();
 
   float elapsedSeconds =
-    (
-      now - gameStartTime
-    )
-    / 1000.0;
-
+    (now - gameStartTime) / 1000.0f;
 
   float deltaSeconds =
-    (
-      now - previousEnemyUpdate
-    )
-    / 1000.0;
+    (now - previousEnemyUpdate) / 1000.0f;
 
-
-  previousEnemyUpdate =
-    now;
+  previousEnemyUpdate = now;
 
 
   // ==========================================================
-  // MOVE ENEMY DOWN
+  // MOVE ALONG CURRENT ROUTE
   // ==========================================================
 
-  enemyBaseY +=
-    ENEMY_DESCENT_SPEED
-    * deltaSeconds;
+  if (ENEMY_PATH_DURATION_SECONDS > 0.0f) {
 
+    // Ship 1 = 1.00x, ship 2 = 1.07x, ship 3 = 1.07^2, etc.
+    // This compounds the requested 7% increase from one ship to the next.
+    float shipSpeedMultiplier =
+      powf(
+        1.0f + ENEMY_SPEED_INCREASE_PER_SHIP,
+        (float)(enemyShipNumber - 1)
+      );
 
-  enemyY =
-    (int)enemyBaseY;
+    // Red ships travel slightly slower while they are in their red phase.
+    // The wiggle calculations below are intentionally NOT multiplied by this.
+    if (enemyIsRed) {
+      shipSpeedMultiplier *= RED_ENEMY_SPEED_MULTIPLIER;
+    }
 
+    enemyPathProgress +=
+      (deltaSeconds / ENEMY_PATH_DURATION_SECONDS)
+      * shipSpeedMultiplier;
+  }
 
-  // ==========================================================
-  // HORIZONTAL WIGGLE
-  // ==========================================================
+  enemyPathProgress =
+    constrain(enemyPathProgress, 0.0f, 1.0f);
 
-  float xPhase =
+  float baseX =
+    enemyStartX +
+    (enemyEndX - enemyStartX) * enemyPathProgress;
 
-    TWO_PI
-    * ENEMY_X_WIGGLE_FREQUENCY
-    * elapsedSeconds;
+  float baseY =
+    enemyStartY +
+    (enemyEndY - enemyStartY) * enemyPathProgress;
 
-
-  float wiggleX =
-
-    sin(xPhase)
-    * ENEMY_X_WIGGLE_AMPLITUDE;
-
-
-  enemyX =
-
-    (int)(
-      ENEMY_START_X
-      + wiggleX
-    );
-
-
-  enemyX =
-    constrain(
-
-      enemyX,
-
-      RECT_LEFT
-        + ENEMY_HALF_WIDTH
-        + MARGIN,
-
-      RECT_RIGHT
-        - ENEMY_HALF_WIDTH
-        - MARGIN
-    );
+  enemyX = (int)roundf(baseX);
+  enemyY = (int)roundf(baseY);
 
 
   // ==========================================================
   // ENEMY ELEVATION WIGGLE
   // ==========================================================
 
+  const float elevationAmplitude =
+    enemyIsRed
+      ? RED_ENEMY_ELEVATION_WIGGLE_AMPLITUDE
+      : GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE;
+
+  const float elevationFrequency =
+    enemyIsRed
+      ? RED_ENEMY_ELEVATION_WIGGLE_FREQUENCY
+      : GREEN_ENEMY_ELEVATION_WIGGLE_FREQUENCY;
+
   float elevationPhase =
-
-    TWO_PI
-    * ENEMY_ELEVATION_WIGGLE_FREQUENCY
-    * elapsedSeconds;
-
+    (
+      TWO_PI
+      * elevationFrequency
+      * elapsedSeconds
+    )
+    + enemyElevationPhaseOffset;
 
   float elevationWiggle =
-
     sin(elevationPhase)
-    * ENEMY_ELEVATION_WIGGLE_AMPLITUDE;
-
+    * elevationAmplitude;
 
   enemyElevationY =
-
     (int)(
-      ENEMY_ELEVATION_CENTER
+      enemyElevationCenterY
       + elevationWiggle
     );
-
 
   int elevationHalfThickness =
     ENEMY_HEIGHT_LINE_THICKNESS / 2;
 
-
   enemyElevationY =
     constrain(
-
       enemyElevationY,
-
-      TICK_Y_MIN
-        + elevationHalfThickness,
-
-      TICK_Y_MAX
-        - elevationHalfThickness
+      TICK_Y_MIN + elevationHalfThickness,
+      TICK_Y_MAX - elevationHalfThickness
     );
 
 
-  // ==========================================================
-  // CHECK BOTTOM
-  // ==========================================================
-
-  if (
-    enemyY >=
-    RECT_BOTTOM
-      - ENEMY_HEIGHT / 2
-  ) {
-
-    return true;
-  }
-
-
-  return false;
+  // Reaching the end of ANY route counts as an escaped ship.
+  return enemyPathProgress >= 1.0f;
 }
 
 
 // ============================================================
-// RESET ENEMY TO TOP
+// RANDOMIZE ENEMY ELEVATION TARGET
+// ============================================================
+//
+// Pick a new up/down target center for every newly spawned ship.
+// The center itself stays inside a reduced safe range so the entire
+// +/- wiggle amplitude also remains inside TICK_Y_MIN..TICK_Y_MAX.
+// ============================================================
+
+void randomizeEnemyElevationTarget() {
+
+  const int elevationHalfThickness =
+    ENEMY_HEIGHT_LINE_THICKNESS / 2;
+
+  const float elevationAmplitude =
+    enemyIsRed
+      ? RED_ENEMY_ELEVATION_WIGGLE_AMPLITUDE
+      : GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE;
+
+  const int safeMinY =
+    TICK_Y_MIN
+    + elevationHalfThickness
+    + (int)ceilf(elevationAmplitude);
+
+  const int safeMaxY =
+    TICK_Y_MAX
+    - elevationHalfThickness
+    - (int)ceilf(elevationAmplitude);
+
+  if (safeMaxY > safeMinY) {
+    enemyElevationCenterY =
+      (float)random(safeMinY, safeMaxY + 1);
+  }
+  else {
+    // Fallback if the allowable range is ever made too small for the
+    // configured wiggle amplitude. Keep the target centered and safe.
+    enemyElevationCenterY =
+      (TICK_Y_MIN + TICK_Y_MAX) / 2.0f;
+  }
+
+  // Also randomize where in the sine wave this ship begins.
+  enemyElevationPhaseOffset =
+    ((float)random(0, 10000) / 10000.0f) * TWO_PI;
+
+  Serial.print("Enemy elevation center = ");
+  Serial.println(enemyElevationCenterY, 1);
+}
+
+
+// ============================================================
+// CONFIGURE CURRENT ENEMY ROUTE
+// ============================================================
+
+void configureEnemyPath() {
+
+  // Every newly spawned ship gets a fresh, legal elevation target.
+  randomizeEnemyElevationTarget();
+
+  const float leftX =
+    RECT_LEFT + ENEMY_HALF_WIDTH + MARGIN + 1;
+
+  const float rightX =
+    RECT_RIGHT - ENEMY_HALF_WIDTH - MARGIN - 1;
+
+  const float topY =
+    RECT_TOP + ENEMY_HEIGHT / 2 + 2;
+
+  const float bottomY =
+    RECT_BOTTOM - ENEMY_HEIGHT / 2 - 2;
+
+  const float middleX =
+    (RECT_LEFT + RECT_RIGHT) / 2.0f;
+
+  const float middleY =
+    (RECT_TOP + RECT_BOTTOM) / 2.0f;
+
+  switch (enemyPathIndex) {
+
+    // Top middle -> bottom middle
+    case 0:
+      enemyStartX = middleX;
+      enemyStartY = topY;
+      enemyEndX   = middleX;
+      enemyEndY   = bottomY;
+      break;
+
+    // Top left -> bottom right
+    case 1:
+      enemyStartX = leftX;
+      enemyStartY = topY;
+      enemyEndX   = rightX;
+      enemyEndY   = bottomY;
+      break;
+
+    // Top right -> bottom left
+    case 2:
+      enemyStartX = rightX;
+      enemyStartY = topY;
+      enemyEndX   = leftX;
+      enemyEndY   = bottomY;
+      break;
+
+    // Middle left -> middle right
+    case 3:
+      enemyStartX = leftX;
+      enemyStartY = middleY;
+      enemyEndX   = rightX;
+      enemyEndY   = middleY;
+      break;
+
+    // Middle right -> middle left
+    default:
+      enemyStartX = rightX;
+      enemyStartY = middleY;
+      enemyEndX   = leftX;
+      enemyEndY   = middleY;
+      break;
+  }
+
+  enemyPathProgress = 0.0f;
+  enemyX = (int)roundf(enemyStartX);
+  enemyY = (int)roundf(enemyStartY);
+}
+
+
+// ============================================================
+// RESET ENEMY TO NEXT ROUTE
 // ============================================================
 
 void resetEnemy() {
 
-  enemyBaseY =
-    RECT_TOP
-    + ENEMY_HEIGHT / 2
-    + 2;
+  enemyShipNumber++;
+  setEnemyColorForShipNumber();
 
+  enemyPathIndex =
+    (enemyPathIndex + 1) % ENEMY_PATH_COUNT;
 
-  enemyY =
-    (int)enemyBaseY;
+  configureEnemyPath();
 
+  previousEnemyUpdate = millis();
 
-  previousEnemyUpdate =
-    millis();
+  float shipSpeedMultiplier =
+    powf(
+      1.0f + ENEMY_SPEED_INCREASE_PER_SHIP,
+      (float)(enemyShipNumber - 1)
+    );
+
+  if (enemyIsRed) {
+    shipSpeedMultiplier *= RED_ENEMY_SPEED_MULTIPLIER;
+  }
+
+  Serial.print("Ship ");
+  Serial.print(enemyShipNumber);
+  Serial.print(enemyIsRed ? " RED" : " GREEN");
+  Serial.print(" route speed = ");
+  Serial.print(shipSpeedMultiplier, 3);
+  Serial.println("x");
 }
 
 
@@ -2291,40 +2633,38 @@ void eraseOldEnemy() {
 
 
 // ============================================================
-// START SCREEN
+// START SCREEN / DIFFICULTY MENU
 // ============================================================
 //
 // Before the game starts:
-//   - TFT stays black and shows "PRESS TO START"
+//   - TFT stays black
+//   - title says "TURBOLASER" inside a thicker red box
+//   - a red border surrounds the entire TFT
+//   - NORMAL is selected by default
+//   - joystick UP selects NORMAL (7 px)
+//   - joystick DOWN selects EASY (10 px)
+//   - selected option is green; the other is dim gray
+//   - either red or green button starts the selected difficulty
 //   - joystick does NOT move either continuous-rotation servo
-//   - red button does nothing
-//   - green button starts the game
 //   - SG90 animation does not play
 //
 // The continuous-rotation servos are commanded to their calibrated
 // stop values once so they remain stationary while waiting.
 // ============================================================
 
-void drawStartScreen() {
+const uint16_t START_MENU_DIM_COLOR = 0x7BEF;  // medium gray in RGB565
 
-  tft.fillScreen(
-    ILI9341_BLACK
-  );
 
-  tft.setTextWrap(
-    false
-  );
+void drawCenteredMenuText(
+  const char* text,
+  int16_t y,
+  uint8_t textSize,
+  uint16_t color
+) {
 
-  tft.setTextColor(
-    ILI9341_WHITE,
-    ILI9341_BLACK
-  );
-
-  tft.setTextSize(
-    2
-  );
-
-  const char* message = "press to start";
+  tft.setTextWrap(false);
+  tft.setTextSize(textSize);
+  tft.setTextColor(color);
 
   int16_t x1;
   int16_t y1;
@@ -2332,7 +2672,7 @@ void drawStartScreen() {
   uint16_t h;
 
   tft.getTextBounds(
-    message,
+    text,
     0,
     0,
     &x1,
@@ -2344,45 +2684,235 @@ void drawStartScreen() {
   int16_t x =
     (tft.width() - (int16_t)w) / 2;
 
-  int16_t y =
-    (tft.height() - (int16_t)h) / 2;
+  tft.setCursor(x, y);
+  tft.print(text);
+}
 
-  tft.setCursor(
-    x,
-    y
+
+void drawDifficultyOptions() {
+
+  // Restore only the menu-option area from the subtle background so
+  // changing difficulty does not disturb the title or instruction text.
+  restoreStartMenuBackgroundRect(
+    0,
+    135,
+    tft.width() - 1,
+    205
   );
 
-  tft.print(
-    message
+  uint16_t normalColor =
+    (selectedDifficulty == DIFFICULTY_NORMAL)
+      ? ILI9341_GREEN
+      : START_MENU_DIM_COLOR;
+
+  uint16_t easyColor =
+    (selectedDifficulty == DIFFICULTY_EASY)
+      ? ILI9341_GREEN
+      : START_MENU_DIM_COLOR;
+
+  drawCenteredMenuText(
+    "Normal",
+    145,
+    1,
+    normalColor
+  );
+
+  drawCenteredMenuText(
+    "Easy",
+    170,
+    1,
+    easyColor
   );
 }
 
 
-void waitForGreenStart() {
+void drawStartScreen() {
 
-  // Ignore the joystick completely while waiting.
+  // Subtle Death Star background for the startup menu.
+  tft.drawRGBBitmap(
+    0,
+    0,
+    startMenuBackgroundBitmap,
+    START_MENU_BG_WIDTH,
+    START_MENU_BG_HEIGHT
+  );
+
+  // Red border around the entire screen.
+  // Two nested rectangles make this border 2 pixels thick.
+  for (int i = 0; i < 2; i++) {
+    tft.drawRect(
+      i,
+      i,
+      tft.width() - i * 2,
+      tft.height() - i * 2,
+      ILI9341_RED
+    );
+  }
+
+  // Large centered title.
+  const char* titleText = "TURBOLASER";
+  const uint8_t titleSize = 4;
+  const int16_t titleY = 42;
+
+  tft.setTextWrap(false);
+  tft.setTextSize(titleSize);
+
+  int16_t titleX1;
+  int16_t titleY1;
+  uint16_t titleW;
+  uint16_t titleH;
+
+  tft.getTextBounds(
+    titleText,
+    0,
+    0,
+    &titleX1,
+    &titleY1,
+    &titleW,
+    &titleH
+  );
+
+  const int16_t titleX =
+    (tft.width() - (int16_t)titleW) / 2;
+
+  const int16_t titlePadX = 8;
+  const int16_t titlePadY = 6;
+
+  // Thicker red outline around the title.
+  // Draw three nested rectangles so the border is 3 pixels thick.
+  for (int i = 0; i < 3; i++) {
+    tft.drawRect(
+      titleX - titlePadX - i,
+      titleY - titlePadY - i,
+      titleW + titlePadX * 2 + i * 2,
+      titleH + titlePadY * 2 + i * 2,
+      ILI9341_RED
+    );
+  }
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(titleX, titleY);
+  tft.print(titleText);
+
+  // Smaller instruction line.
+  drawCenteredMenuText(
+    "press to start",
+    105,
+    2,
+    ILI9341_WHITE
+  );
+
+  drawDifficultyOptions();
+}
+
+
+void applySelectedDifficulty() {
+
+  if (selectedDifficulty == DIFFICULTY_EASY) {
+    hitXThresholdPx = EASY_HIT_THRESHOLD_PX;
+    hitYThresholdPx = EASY_HIT_THRESHOLD_PX;
+  }
+  else {
+    hitXThresholdPx = NORMAL_HIT_THRESHOLD_PX;
+    hitYThresholdPx = NORMAL_HIT_THRESHOLD_PX;
+  }
+}
+
+
+void waitForStartButton() {
+
+  // Ignore the joystick for servo movement while waiting.
   // Keep the movement servos parked at neutral.
   stopJoystickServos();
 
+  selectedDifficulty = DIFFICULTY_NORMAL;
+  applySelectedDifficulty();
+  drawDifficultyOptions();
+
   Serial.println(
-    "Waiting for GREEN button to start..."
+    "Start menu: NORMAL selected (7 px). Use joystick UP/DOWN, then press a button to start."
   );
 
-  // Active LOW because GPIO35 has the external pull-up resistor.
-  while (digitalRead(PIN_GREEN_BUTTON) != LOW) {
+  bool previousUp = false;
+  bool previousDown = false;
+
+  while (true) {
+
+    bool upPressed =
+      (digitalRead(PIN_UP) == LOW);
+
+    bool downPressed =
+      (digitalRead(PIN_DOWN) == LOW);
+
+    // Use edge detection so holding the joystick does not repeatedly redraw.
+    if (upPressed && !previousUp) {
+
+      if (selectedDifficulty != DIFFICULTY_NORMAL) {
+        selectedDifficulty = DIFFICULTY_NORMAL;
+        applySelectedDifficulty();
+        drawDifficultyOptions();
+
+        Serial.println(
+          "Difficulty selected: NORMAL (7 px)"
+        );
+      }
+    }
+
+    if (downPressed && !previousDown) {
+
+      if (selectedDifficulty != DIFFICULTY_EASY) {
+        selectedDifficulty = DIFFICULTY_EASY;
+        applySelectedDifficulty();
+        drawDifficultyOptions();
+
+        Serial.println(
+          "Difficulty selected: EASY (10 px)"
+        );
+      }
+    }
+
+    previousUp = upPressed;
+    previousDown = downPressed;
+
+    // Difficulty is now chosen by the menu, so either physical shot button
+    // can simply start the game.
+    bool greenStart =
+      (digitalRead(PIN_GREEN_BUTTON) == LOW);
+
+    bool redStart =
+      (digitalRead(PIN_RED_BUTTON) == LOW);
+
+    if (greenStart || redStart) {
+
+      delay(30);
+
+      // Wait for whichever start button was pressed to be released so the
+      // menu press cannot become the first shot after gameplay begins.
+      while (
+        digitalRead(PIN_GREEN_BUTTON) == LOW ||
+        digitalRead(PIN_RED_BUTTON) == LOW
+      ) {
+        delay(5);
+      }
+
+      delay(30);
+
+      applySelectedDifficulty();
+
+      Serial.print("Game starting: ");
+
+      if (selectedDifficulty == DIFFICULTY_EASY) {
+        Serial.println("EASY, 10 px hit threshold");
+      }
+      else {
+        Serial.println("NORMAL, 7 px hit threshold");
+      }
+
+      return;
+    }
+
     delay(5);
   }
-
-  // Small debounce.
-  delay(30);
-
-  // Wait for release so the start press does not immediately become
-  // the first gameplay button press after the button task begins.
-  while (digitalRead(PIN_GREEN_BUTTON) == LOW) {
-    delay(5);
-  }
-
-  delay(30);
 }
 
 
@@ -2550,9 +3080,10 @@ void setup() {
 
   drawStartScreen();
 
-  // Nothing in the game runs until the green button is pressed.
-  // The joystick is ignored during this wait, so the servos stay still.
-  waitForGreenStart();
+  // Nothing in the game runs until the player chooses NORMAL/EASY with
+  // the joystick and presses either shot button to start. The joystick is
+  // used only for menu selection here; the servos stay parked at neutral.
+  waitForStartButton();
 
 
   // ==========================================================
@@ -2571,6 +3102,12 @@ void setup() {
   lrTravelPositionMs = 0;
   lrPreviousMoveDirection = 0;
   lrLastTravelUpdateMs = millis();
+
+  // The up/down turret is also assumed to be physically centered when
+  // gameplay begins. Start its open-loop position estimate at center.
+  udTravelPositionMs = 0;
+  udPreviousMoveDirection = 0;
+  udLastTravelUpdateMs = millis();
 
   aimAngleDeg = 0.0f;
   tickY = (TICK_Y_MIN + TICK_Y_MAX) / 2;
@@ -2619,6 +3156,12 @@ void setup() {
   previousEnemyUpdate =
     gameStartTime;
 
+
+  // The first ship always starts on route 0: top middle -> bottom middle.
+  enemyPathIndex = 0;
+  enemyShipNumber = 1;
+  setEnemyColorForShipNumber();
+  configureEnemyPath();
 
   updateEnemyPosition();
 
@@ -2786,12 +3329,14 @@ void loop() {
   // continues normally while the servo moves.
   // ==========================================================
 
-  if (
-    greenButtonPressedThisFrame ||
-    redButtonPressedThisFrame
-  ) {
+  if (redButtonPressedThisFrame) {
 
-    triggerServoAnimation();
+    // Half speed = twice the normal animation duration.
+    triggerServoAnimation(2.0f);
+  }
+  else if (greenButtonPressedThisFrame) {
+
+    triggerServoAnimation(1.0f);
   }
 
 
@@ -2902,58 +3447,71 @@ void loop() {
 
 
   // ==========================================================
-  // PLAYER HEIGHT
+  // PLAYER HEIGHT - SYNCHRONIZED TO PHYSICAL UP/DOWN TURRET
   // ==========================================================
+  // The physical UD turret tracks its estimated position as elapsed
+  // movement time from the startup center:
+  //
+  //   -1100 ms = full up   = TICK_Y_MIN
+  //       0 ms = center    = middle of the elevation bar
+  //   +1100 ms = full down = TICK_Y_MAX
+  //
+  // Both the physical servo limit and the TFT elevation marker use the
+  // SAME udTravelPositionMs value, so a full top-to-bottom sweep takes
+  // exactly 2200 ms and the display stays synchronized with the
+  // software-estimated physical turret position.
 
-  if (up) {
+  float udNormalized =
+    ((float)udTravelPositionMs + (float)UD_TRAVEL_LIMIT_MS) /
+    (2.0f * (float)UD_TRAVEL_LIMIT_MS);
 
-    tickY -=
-      TICK_STEP;
+  udNormalized = constrain(udNormalized, 0.0f, 1.0f);
 
-
-    tickChanged =
-      true;
-  }
-
-
-  if (down) {
-
-    tickY +=
-      TICK_STEP;
-
-
-    tickChanged =
-      true;
-  }
-
-
-  tickY =
-    constrain(
-
-      tickY,
-
-      TICK_Y_MIN,
-
-      TICK_Y_MAX
+  int newTickY =
+    (int)roundf(
+      (float)TICK_Y_MIN +
+      udNormalized * (float)(TICK_Y_MAX - TICK_Y_MIN)
     );
+
+  newTickY = constrain(
+    newTickY,
+    TICK_Y_MIN,
+    TICK_Y_MAX
+  );
+
+  if (newTickY != tickY) {
+    tickY = newTickY;
+    tickChanged = true;
+  }
 
 
   // ==========================================================
   // SHOOTING / HIT DETECTION
   // ==========================================================
-  // Either accepted gameplay button is treated as a shot.
-  // A hit requires BOTH horizontal aim and elevation to be close.
+  // Red enemies can ONLY be advanced with the RED button.
+  // Once a red enemy is hit, it flickers twice and becomes green at the
+  // same route position. Green enemies keep the normal behavior and may
+  // be hit by either accepted gameplay button.
+  // Every hit still requires BOTH horizontal aim and elevation alignment.
+
+  bool correctShotButton = false;
+
+  if (enemyIsRed) {
+    correctShotButton = redButtonPressedThisFrame;
+  }
+  else {
+    correctShotButton =
+      greenButtonPressedThisFrame ||
+      redButtonPressedThisFrame;
+  }
 
   if (
     !enemyHitAnimating &&
-    (
-      greenButtonPressedThisFrame ||
-      redButtonPressedThisFrame
-    ) &&
+    correctShotButton &&
     shotHitsEnemy()
   ) {
 
-    beginEnemyHit();
+    beginEnemyHit(enemyIsRed);
   }
 
 
@@ -3001,7 +3559,7 @@ void loop() {
   if (enemyHitAnimating) {
 
     // Freeze the ship while it flickers. This routine resets the
-    // enemy to the top automatically after two quick flickers.
+    // enemy on the next route automatically after two quick flickers.
     updateEnemyHitAnimation();
   }
   else {
