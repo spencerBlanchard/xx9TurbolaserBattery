@@ -14,11 +14,11 @@
 //   Up / Down    = elevation marker + physical up/down servo
 //
 // ENEMY:
-//   Green triangle moves downward through right / aim section
-//   Green horizontal marker shows enemy elevation in left section
+//   Normal and shielded X-wing sprites move through the aim section
+//   A matching horizontal marker shows enemy elevation on the left
 //
 // HEALTH:
-//   Red health bar at bottom
+//   Three hearts at the top-right
 //   3 missed enemies = GAME OVER
 //
 // BUTTON / LED SYSTEM:
@@ -60,9 +60,12 @@
 #include <Adafruit_PWMServoDriver.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <Preferences.h>
+#include "calibration_frames.h"
 #include <math.h>
 #include "background_bitmap.h"
 #include "start_menu_background_bitmap.h"
+#include "xwing_sprites.h"
 
 
 // Set to 1 only while debugging. Keeping this at 0 removes
@@ -198,12 +201,12 @@ const uint8_t LR_SERVO_CHANNEL = 2;
 // ============================================================
 
 const uint16_t LR_LEFT_TICKS  = 351;
-const uint16_t LR_STOP_TICKS  = 371;
+const uint16_t LR_STOP_TICKS  = 370;
 const uint16_t LR_RIGHT_TICKS = 381;
 
-const uint16_t UD_UP_TICKS    = 380;
-const uint16_t UD_STOP_TICKS  = 370;
-const uint16_t UD_DOWN_TICKS  = 350;
+const uint16_t UD_UP_TICKS    = 390;
+const uint16_t UD_STOP_TICKS  = 369;
+const uint16_t UD_DOWN_TICKS  = 353;
 
 // Cache the last command so we do not repeatedly rewrite the same
 // PCA9685 value every frame. -1 means no command has been sent yet.
@@ -246,14 +249,14 @@ unsigned long lrLastTravelUpdateMs = 0;
 // rotation servo has actually been commanded to move.
 //
 // Center = 0 ms
-// Full up limit   = -1500 ms from center
-// Full down limit = +1500 ms from center
+// Full up limit   = -1000 ms from center
+// Full down limit = +1000 ms from center
 //
 // This makes the complete physical top-to-bottom command-time sweep
-// exactly 6.0 seconds, matching the TFT elevation marker.
+// exactly 2.0 seconds, matching the TFT elevation marker.
 // ============================================================
 
-const int32_t UD_TRAVEL_LIMIT_MS = 1100;
+const int32_t UD_TRAVEL_LIMIT_MS = 1000;
 
 // Signed estimated vertical position, expressed as equivalent
 // milliseconds of servo travel from the startup center position.
@@ -328,6 +331,10 @@ const unsigned long GREEN_BUTTON_TIMEOUT_MS = 1000;
 const unsigned long RED_BUTTON_GREEN_TIMEOUT_MS = 2000;
 const unsigned long RED_BUTTON_RED_TIMEOUT_MS   = 4000;
 
+// Activated by the one-time S+ target in absolute round 6.
+volatile bool turbolaserSpeedBoostActive = false;
+const float SPEED_BOOST_COOLDOWN_MULTIPLIER = 0.75f;
+
 
 // Button remains disabled this much longer
 // AFTER its corresponding LED returns.
@@ -377,6 +384,7 @@ bool previousRedButton   = false;
 
 bool greenButtonPressedThisFrame = false;
 bool redButtonPressedThisFrame   = false;
+bool redButtonCooldownPressedThisFrame = false;
 
 
 // ============================================================
@@ -405,6 +413,7 @@ volatile bool buttonWakeInterruptsAttached = false;
 portMUX_TYPE buttonEventMux = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t pendingGreenPresses = 0;
 volatile uint32_t pendingRedPresses   = 0;
+volatile uint32_t pendingRedCooldownPresses = 0;
 
 
 // ============================================================
@@ -461,8 +470,8 @@ int tickY =
 // ENEMY - RIGHT / AIM SECTION
 // ============================================================
 
-const int ENEMY_HALF_WIDTH = 7;
-const int ENEMY_HEIGHT     = 10;
+const int ENEMY_HALF_WIDTH = XWING_WIDTH / 2;
+const int ENEMY_HEIGHT     = XWING_HEIGHT;
 
 
 // Pixels per second
@@ -491,9 +500,10 @@ const float ENEMY_PATH_DURATION_SECONDS =
    - (RECT_TOP + ENEMY_HEIGHT / 2 + 2))
   / ENEMY_DESCENT_SPEED;
 
-// Each new ship moves 7% faster along its start-to-end route than the
-// previous ship. This only affects route traversal; wiggle timing is unchanged.
-const float ENEMY_SPEED_INCREASE_PER_SHIP = 0.07f;
+// Each round is 5% faster than the round before it, continuing across
+// repeated 10-round cycles. Two-ship rounds also use a 70% speed factor.
+const float ENEMY_SPEED_INCREASE_PER_ROUND = 0.05f;
+const float MULTI_ENEMY_SPEED_MULTIPLIER = 0.70f;
 
 // Red-phase enemies move slightly slower while red. Once a red enemy is hit
 // and turns green, it immediately resumes the normal speed for its ship number.
@@ -550,18 +560,63 @@ int enemyElevationY;
 const uint16_t ENEMY_GREEN_COLOR = ILI9341_GREEN;
 const uint16_t ENEMY_RED_COLOR   = ILI9341_RED;
 
-// Every spawned ship gets a 1-based number.
-// Ships 1, 2, and 4 start green. Ship 3, ship 5, and every ship after 5 start red.
+// Absolute round number. The 10-round pattern repeats forever while this
+// value keeps increasing so the 5% speed increase continues accumulating.
 uint32_t enemyShipNumber = 1;
 bool enemyIsRed = false;
+int enemyHealth = 1;
+bool primaryEnemyActive = true;
+
+uint8_t roundInCycle() {
+  return ((enemyShipNumber - 1) % 10) + 1;
+}
+
+bool roundHasTwoEnemies() {
+  uint8_t round = roundInCycle();
+  return round == 7 || round == 9;
+}
 
 uint16_t currentEnemyColor() {
   return enemyIsRed ? ENEMY_RED_COLOR : ENEMY_GREEN_COLOR;
 }
 
 void setEnemyColorForShipNumber() {
-  enemyIsRed = (enemyShipNumber == 3 || enemyShipNumber >= 5);
+  uint8_t round = roundInCycle();
+  enemyIsRed =
+    round == 3 || round == 4 || round == 6 ||
+    round == 8 || round == 9 || round == 10;
+  enemyHealth = enemyIsRed ? 3 : 1;
 }
+
+// Independent second target used only in rounds 7 and 9.
+bool enemy2Active = false;
+bool enemy2IsRed = false;
+int enemy2Health = 1;
+uint8_t enemy2PathIndex = 0;
+float enemy2PathProgress = 0.0f;
+float enemy2StartX = 0.0f;
+float enemy2StartY = 0.0f;
+float enemy2EndX = 0.0f;
+float enemy2EndY = 0.0f;
+int enemy2X = 0;
+int enemy2Y = 0;
+float enemy2ElevationCenterY = (TICK_Y_MIN + TICK_Y_MAX) / 2.0f;
+float enemy2ElevationPhaseOffset = 0.0f;
+int enemy2ElevationY = 0;
+unsigned long previousEnemy2Update = 0;
+int prevEnemy2X = 0;
+int prevEnemy2Y = 0;
+int prevEnemy2ElevationY = 0;
+
+bool enemy2HitAnimating = false;
+bool enemy2VisibleDuringHit = true;
+unsigned long enemy2HitLastToggleMs = 0;
+int enemy2HitTransitionCount = 0;
+unsigned long enemy2HitFlickerIntervalMs = 70;
+int enemy2HitFlickerTransitions = 4;
+bool enemy2HitDestroys = false;
+bool enemy2HitRemovesShield = false;
+bool enemy2HitWasShielded = false;
 
 
 // ============================================================
@@ -581,25 +636,70 @@ bool gameOver = false;
 
 int score = 0;
 
-// Small top-right score box. Scores 0-9 are shown as 00-09.
-const int SCORE_BOX_X = 272;
+// Small top-left score box. Scores 0-9 are shown as 00-09.
+const int SCORE_BOX_X = 2;
 const int SCORE_BOX_Y = 2;
 const int SCORE_BOX_W = 46;
 const int SCORE_BOX_H = 13;
+
+// Three hearts in the top-right replace the old bottom health bar.
+const int HEARTS_BOX_X = 272;
+const int HEARTS_BOX_Y = 2;
+const int HEARTS_BOX_W = 46;
+const int HEARTS_BOX_H = 13;
+
+// Easy-mode tutorial messages use the otherwise empty strip between the
+// score and hearts. They never pause movement, aiming, or button input.
+const int TUTORIAL_BOX_X = 50;
+const int TUTORIAL_BOX_Y = 2;
+const int TUTORIAL_BOX_W = 220;
+const int TUTORIAL_BOX_H = 13;
+const unsigned long TUTORIAL_MESSAGE_DURATION_MS = 5000;
+const unsigned long TUTORIAL_PAGE_DURATION_MS = 1500;
+const unsigned long TUTORIAL_ARROW_BLINK_MS = 200;
+
+enum TutorialMessage {
+  TUTORIAL_NONE,
+  TUTORIAL_ELEVATION,
+  TUTORIAL_SHIELD,
+  TUTORIAL_RED_COOLDOWN,
+  TUTORIAL_BUTTON_LIGHTS,
+  TUTORIAL_SPEED_BOOST
+};
+
+TutorialMessage activeTutorialMessage = TUTORIAL_NONE;
+unsigned long tutorialMessageStartedMs = 0;
+int tutorialLastPage = -1;
+bool tutorialArrowVisible = false;
+unsigned long tutorialArrowLastToggleMs = 0;
+uint32_t lastElevationHintShipNumber = 0;
+bool shieldHintShown = false;
+bool redCooldownHintShown = false;
+bool buttonLightsHintShown = false;
+uint32_t firstRedCooldownHintShipNumber = 0;
+uint32_t lastAcceptedRedOnShieldedShip = 0;
+
+// Stationary speed-boost target; it appears only during absolute round 6.
+bool speedBoostTargetActive = false;
+int speedBoostX = 0;
+int speedBoostY = 0;
+int prevSpeedBoostX = 0;
+int prevSpeedBoostY = 0;
+const int SPEED_BOOST_RADIUS = 13;
 
 // A shot counts when BOTH targeting dimensions are close enough:
 //   1) the white aim line passes close to the ship's X position
 //   2) the white elevation tick is close to the enemy elevation marker
 //
 // Difficulty is selected from the joystick-controlled start menu.
-// NORMAL is selected by default and uses the tighter 7 px threshold.
-// EASY uses the more forgiving 10 px threshold.
-const int NORMAL_HIT_THRESHOLD_PX = 7;
-const int EASY_HIT_THRESHOLD_PX   = 10;
+// HARD uses the tighter 7 px threshold.
+// NORMAL uses the more forgiving 10 px threshold.
+const int HARD_HIT_THRESHOLD_PX   = 7;
+const int NORMAL_HIT_THRESHOLD_PX = 10;
 
 enum GameDifficulty {
   DIFFICULTY_NORMAL,
-  DIFFICULTY_EASY
+  DIFFICULTY_HARD
 };
 
 GameDifficulty selectedDifficulty = DIFFICULTY_NORMAL;
@@ -607,26 +707,89 @@ GameDifficulty selectedDifficulty = DIFFICULTY_NORMAL;
 int hitXThresholdPx = NORMAL_HIT_THRESHOLD_PX;
 int hitYThresholdPx = NORMAL_HIT_THRESHOLD_PX;
 
-// Quick two-flicker hit animation. Enemy movement pauses during it.
-const unsigned long HIT_FLICKER_INTERVAL_MS = 70;
-const int HIT_FLICKER_TRANSITIONS = 4; // off/on/off/on, then disappear + respawn
+enum MainMenuOption {
+  MENU_NORMAL,
+  MENU_HARD,
+  MENU_HIGH_SCORES,
+  MENU_OPTION_COUNT
+};
+
+MainMenuOption selectedMenuOption = MENU_NORMAL;
+
+const int HIGH_SCORE_COUNT = 5;
+
+struct HighScoreEntry {
+  char initials[4];
+  uint32_t score;
+  uint32_t timeMs;
+};
+
+HighScoreEntry normalHighScores[HIGH_SCORE_COUNT];
+HighScoreEntry hardHighScores[HIGH_SCORE_COUNT];
+Preferences highScorePreferences;
+bool highScoresReady = false;
+
+const char* HIGH_SCORE_NAMESPACE = "turbolaser";
+const char* NORMAL_SCORES_KEY = "normal";
+const char* HARD_SCORES_KEY = "hard";
+
+uint32_t currentGameElapsedMs = 0;
+
+bool highScoreComesBefore(
+  uint32_t newScore,
+  uint32_t newTimeMs,
+  const HighScoreEntry& existing
+);
+HighScoreEntry* scoresForDifficulty(GameDifficulty difficulty);
+int qualifyingHighScoreIndex(
+  GameDifficulty difficulty,
+  uint32_t candidateScore,
+  uint32_t candidateTimeMs
+);
+void insertHighScore(
+  GameDifficulty difficulty,
+  const char* initials,
+  uint32_t newScore,
+  uint32_t newTimeMs
+);
+void drawHighScoreScreen(GameDifficulty difficulty);
+void showHighScoreBrowser(GameDifficulty shownDifficulty);
+void drawCenteredMenuText(
+  const char* text,
+  int16_t y,
+  uint8_t textSize,
+  uint16_t color
+);
+void finishGameOverFlow();
+void getShotAlignment(bool& horizontalAligned, bool& verticalAligned);
+void showTutorialMessage(TutorialMessage message);
+void updateTutorialMessage();
+
+// Non-destroying hits keep the original quick two-flicker feedback.
+const unsigned long DAMAGE_FLICKER_INTERVAL_MS = 70;
+const int DAMAGE_FLICKER_TRANSITIONS = 4;
+
+// Destruction: explosion -> X-wing -> explosion -> next enemy.
+// Three 500 ms phases take 1.5 seconds total.
+const unsigned long DESTROY_FLICKER_INTERVAL_MS = 500;
+const int DESTROY_FLICKER_TRANSITIONS = 3;
 
 bool enemyHitAnimating = false;
 bool enemyVisibleDuringHit = true;
 unsigned long enemyHitLastToggleMs = 0;
 int enemyHitTransitionCount = 0;
+unsigned long enemyHitFlickerIntervalMs = DAMAGE_FLICKER_INTERVAL_MS;
+int enemyHitFlickerTransitions = DAMAGE_FLICKER_TRANSITIONS;
 
-// false: normal green hit -> destroy + respawn
-// true: red hit -> flicker, then turn green and continue same route
-bool enemyHitTurnsGreen = false;
-
-
-// Thin red bar at bottom
-const int HEALTH_BAR_X = 10;
-const int HEALTH_BAR_Y = 235;
-
-const int HEALTH_BAR_WIDTH  = 300;
-const int HEALTH_BAR_HEIGHT = 3;
+// Normal X-wings have 1 HP. Shielded X-wings have 3 HP.
+// Green-button shots deal 1 damage; red-button shots deal 3 damage.
+bool enemyHitDestroys = false;
+bool enemyHitRemovesShield = false;
+bool enemyHitWasShielded = false;
+const int EXPLOSION_WIDTH = 30;
+const int EXPLOSION_HEIGHT = 20;
+const int SHIELD_EXPLOSION_WIDTH = 39;  // 1.3 x normal
+const int SHIELD_EXPLOSION_HEIGHT = 26;
 
 
 // ============================================================
@@ -656,7 +819,7 @@ int prevLineY1;
 int prevTickY;
 
 
-// Enemy triangle
+// Enemy X-wing sprite
 int prevEnemyX;
 int prevEnemyY;
 
@@ -988,6 +1151,46 @@ void stopJoystickServos() {
 }
 
 
+// Stop generating PWM pulses on every servo channel. This is different
+// from sending the calibrated neutral values: PCA9685 off=4096 sets the
+// channel's FULL OFF bit, so the servos receive no control signal at all.
+void disableAllServoSignals() {
+
+  servoAnimationState =
+    SERVO_ANIM_IDLE;
+
+  digitalWrite(
+    PIN_ANIMATION_LED,
+    LOW
+  );
+
+  pwm.setPWM(
+    ANIMATION_SERVO_CHANNEL,
+    0,
+    4096
+  );
+
+  pwm.setPWM(
+    UD_SERVO_CHANNEL,
+    0,
+    4096
+  );
+
+  pwm.setPWM(
+    LR_SERVO_CHANNEL,
+    0,
+    4096
+  );
+
+  lastLRServoTicks = -1;
+  lastUDServoTicks = -1;
+  lrPreviousMoveDirection = 0;
+  udPreviousMoveDirection = 0;
+  lrLastTravelUpdateMs = millis();
+  udLastTravelUpdateMs = millis();
+}
+
+
 void updateJoystickServos(
   bool left,
   bool right,
@@ -1275,11 +1478,17 @@ void updateButtonsAndLeds() {
 
 
     unsigned long newGreenLedTimeout =
-      now + GREEN_BUTTON_TIMEOUT_MS;
+      now + (unsigned long)(
+        GREEN_BUTTON_TIMEOUT_MS *
+        (turbolaserSpeedBoostActive ? SPEED_BOOST_COOLDOWN_MULTIPLIER : 1.0f)
+      );
 
 
     unsigned long newRedLedTimeout =
-      now + GREEN_BUTTON_TIMEOUT_MS;
+      now + (unsigned long)(
+        GREEN_BUTTON_TIMEOUT_MS *
+        (turbolaserSpeedBoostActive ? SPEED_BOOST_COOLDOWN_MULTIPLIER : 1.0f)
+      );
 
 
     // --------------------------------------------------------
@@ -1365,12 +1574,18 @@ void updateButtonsAndLeds() {
 
     unsigned long newGreenLedTimeout =
       now +
-      RED_BUTTON_GREEN_TIMEOUT_MS;
+      (unsigned long)(
+        RED_BUTTON_GREEN_TIMEOUT_MS *
+        (turbolaserSpeedBoostActive ? SPEED_BOOST_COOLDOWN_MULTIPLIER : 1.0f)
+      );
 
 
     unsigned long newRedLedTimeout =
       now +
-      RED_BUTTON_RED_TIMEOUT_MS;
+      (unsigned long)(
+        RED_BUTTON_RED_TIMEOUT_MS *
+        (turbolaserSpeedBoostActive ? SPEED_BOOST_COOLDOWN_MULTIPLIER : 1.0f)
+      );
 
 
     // --------------------------------------------------------
@@ -1416,6 +1631,24 @@ void updateButtonsAndLeds() {
       "RED BUTTON ACCEPTED - track 4"
     );
 #endif
+  }
+
+  // Let the game tutorial know that the player physically pressed RED
+  // while it was still disabled. This is not an accepted shot: it does
+  // not play audio, restart LEDs, or trigger recoil.
+  if (
+    redButtonNewPress &&
+    !redButtonEnabled
+  ) {
+    portENTER_CRITICAL(
+      &buttonEventMux
+    );
+
+    pendingRedCooldownPresses++;
+
+    portEXIT_CRITICAL(
+      &buttonEventMux
+    );
   }
 
 
@@ -1491,6 +1724,7 @@ void consumeButtonEvents() {
 
   bool greenEvent = false;
   bool redEvent = false;
+  bool redCooldownEvent = false;
 
 
   portENTER_CRITICAL(
@@ -1512,6 +1746,13 @@ void consumeButtonEvents() {
   }
 
 
+  if (pendingRedCooldownPresses > 0) {
+
+    pendingRedCooldownPresses--;
+    redCooldownEvent = true;
+  }
+
+
   portEXIT_CRITICAL(
     &buttonEventMux
   );
@@ -1524,6 +1765,9 @@ void consumeButtonEvents() {
 
   redButtonPressedThisFrame =
     redEvent;
+
+  redButtonCooldownPressedThisFrame =
+    redCooldownEvent;
 }
 
 
@@ -1657,6 +1901,43 @@ void computeLineBBox(
 // RESTORE PART OF BACKGROUND BITMAP
 // ============================================================
 
+uint16_t gameplayBackgroundColor(uint16_t color) {
+  if (selectedDifficulty != DIFFICULTY_HARD) {
+    return color;
+  }
+
+  uint8_t red = (color >> 11) & 0x1F;
+  uint8_t green = (color >> 5) & 0x3F;
+  uint8_t blue = color & 0x1F;
+
+  // The supplied background is black with blue/cyan artwork. Convert only
+  // pixels whose blue component dominates; neutral UI colors remain intact.
+  if (blue > red && (uint16_t)blue * 2 >= green) {
+    uint8_t redIntensity = max(blue, (uint8_t)(green / 2));
+    return ((uint16_t)redIntensity << 11);
+  }
+
+  return color;
+}
+
+
+void drawGameplayBackground() {
+  if (selectedDifficulty != DIFFICULTY_HARD) {
+    tft.drawRGBBitmap(0, 0, backgroundBitmap, BG_WIDTH, BG_HEIGHT);
+    return;
+  }
+
+  uint16_t convertedRow[BG_WIDTH];
+  for (int y = 0; y < BG_HEIGHT; y++) {
+    for (int x = 0; x < BG_WIDTH; x++) {
+      convertedRow[x] = gameplayBackgroundColor(
+        pgm_read_word(backgroundBitmap + y * BG_WIDTH + x)
+      );
+    }
+    tft.drawRGBBitmap(0, y, convertedRow, BG_WIDTH, 1);
+  }
+}
+
 void restoreBackgroundRect(
   int x0,
   int y0,
@@ -1712,18 +1993,22 @@ void restoreBackgroundRect(
   ) {
 
     const uint16_t* rowPtr =
-      backgroundBitmap
-      + y * BG_WIDTH
-      + x0;
+      backgroundBitmap + y * BG_WIDTH + x0;
 
-
-    tft.drawRGBBitmap(
-      x0,
-      y,
-      rowPtr,
-      w,
-      1
-    );
+    if (selectedDifficulty == DIFFICULTY_HARD) {
+      // Dynamic erasing must use the same red conversion as the initial
+      // Hard-mode draw or moving objects would reveal blue trails.
+      uint16_t convertedRow[BG_WIDTH];
+      for (int x = 0; x < w; x++) {
+        convertedRow[x] = gameplayBackgroundColor(
+          pgm_read_word(rowPtr + x)
+        );
+      }
+      tft.drawRGBBitmap(x0, y, convertedRow, w, 1);
+    }
+    else {
+      tft.drawRGBBitmap(x0, y, rowPtr, w, 1);
+    }
   }
 }
 
@@ -1863,41 +2148,89 @@ void drawTick(int y) {
 
 
 // ============================================================
-// DRAW ENEMY TRIANGLE
+// DRAW ENEMY X-WING
 // ============================================================
 
-void drawEnemyShip(
+void drawEnemyShipAt(
   int x,
-  int y
+  int y,
+  bool shielded
 ) {
 
-  int topY =
-    y - ENEMY_HEIGHT / 2;
+  const uint16_t* pixels =
+    shielded
+      ? XWING_SHIELD_PIXELS
+      : XWING_NORMAL_PIXELS;
 
+  const uint8_t* mask =
+    shielded
+      ? XWING_SHIELD_MASK
+      : XWING_NORMAL_MASK;
 
-  int bottomY =
-    y + ENEMY_HEIGHT / 2;
-
-
-  tft.fillTriangle(
-
-    x - ENEMY_HALF_WIDTH,
-    topY,
-
-    x + ENEMY_HALF_WIDTH,
-    topY,
-
-    x,
-    bottomY,
-
-    currentEnemyColor()
+  tft.drawRGBBitmap(
+    x - XWING_WIDTH / 2,
+    y - XWING_HEIGHT / 2,
+    pixels,
+    mask,
+    XWING_WIDTH,
+    XWING_HEIGHT
   );
+}
+
+void drawEnemyShip(int x, int y) {
+  drawEnemyShipAt(x, y, enemyIsRed);
 }
 
 
 // ============================================================
 // DRAW ENEMY HEIGHT MARKER
 // ============================================================
+
+// Pixel-art source, scaled to the requested explosion footprint.
+// Dots are transparent; background restoration erases the previous frame.
+const char EXPLOSION_PIXELS[15][24] PROGMEM = {
+  ".....R...........R.....",
+  "......RR...R...RR......",
+  "..R...ROR.ROR.ROR...R..",
+  "...RR.ROOROOROOR.RR....",
+  "....ROOOYYYYYOOOR......",
+  "RRROOOYYYYWYYYYOOORRR..",
+  "..ROOYYWWWWWWWYYOOR....",
+  "...OOYYWWWWWWWYYOO.....",
+  "..ROOYYWWWWWWWYYOOR....",
+  "RRROOOYYYYWYYYYOOORRR..",
+  "....ROOOYYYYYOOOR......",
+  "...RR.ROOROOROOR.RR....",
+  "..R...ROR.ROR.ROR...R..",
+  "......RR...R...RR......",
+  ".....R...........R.....",
+};
+
+void drawEnemyExplosionAt(int x, int y, bool wasShielded) {
+  const int width = wasShielded ? SHIELD_EXPLOSION_WIDTH : EXPLOSION_WIDTH;
+  const int height = wasShielded ? SHIELD_EXPLOSION_HEIGHT : EXPLOSION_HEIGHT;
+  tft.startWrite();
+  for (int row = 0; row < height; ++row) {
+    for (int col = 0; col < width; ++col) {
+      int px = x - width / 2 + col;
+      int py = y - height / 2 + row;
+      if (px <= RECT_LEFT || px >= RECT_RIGHT ||
+          py <= RECT_TOP || py >= RECT_BOTTOM) continue;
+      char pixel = pgm_read_byte(&EXPLOSION_PIXELS[row * 15 / height][col * 23 / width]);
+      if (pixel == '.') continue;
+      uint16_t color = ILI9341_WHITE;
+      if (pixel == 'R') color = ILI9341_RED;
+      else if (pixel == 'O') color = 0xFD20;
+      else if (pixel == 'Y') color = ILI9341_YELLOW;
+      tft.writePixel(px, py, color);
+    }
+  }
+  tft.endWrite();
+}
+
+void drawEnemyExplosion(int x, int y) {
+  drawEnemyExplosionAt(x, y, enemyHitWasShielded);
+}
 
 void drawEnemyElevation(int y) {
 
@@ -1919,8 +2252,33 @@ void drawEnemyElevation(int y) {
   );
 }
 
+void drawEnemyElevationAt(int y, bool shielded) {
+  int halfThickness = ENEMY_HEIGHT_LINE_THICKNESS / 2;
+  tft.fillRect(
+    TICK_X_LEFT,
+    y - halfThickness,
+    TICK_X_RIGHT - TICK_X_LEFT,
+    ENEMY_HEIGHT_LINE_THICKNESS,
+    shielded ? ENEMY_RED_COLOR : ENEMY_GREEN_COLOR
+  );
+}
+
+
+void drawSpeedBoostTarget() {
+  if (!speedBoostTargetActive) return;
+
+  tft.fillCircle(speedBoostX, speedBoostY, SPEED_BOOST_RADIUS, ILI9341_GREEN);
+  tft.drawCircle(speedBoostX, speedBoostY, SPEED_BOOST_RADIUS, ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_BLACK);
+  tft.setCursor(speedBoostX - 6, speedBoostY - 3);
+  tft.print("S+");
+}
+
 
 void resetEnemy();
+void finishRoundIfReady();
+void eraseSpeedBoostTarget();
 
 
 // ============================================================
@@ -1982,10 +2340,181 @@ void drawScoreBox() {
 
 
 // ============================================================
+// EASY-MODE TUTORIAL MESSAGES
+// ============================================================
+
+void clearTutorialArrow() {
+  restoreBackgroundRect(36, 23, 48, 47);
+  tutorialArrowVisible = false;
+}
+
+
+void drawTutorialArrow(bool bright) {
+  clearTutorialArrow();
+
+  // Point left toward the elevation aiming box without covering it.
+  tft.fillTriangle(
+    36, 35,
+    48, 23,
+    48, 47,
+    bright ? ILI9341_YELLOW : ILI9341_WHITE
+  );
+
+  // The notch gives the larger arrow a bold chevron shape.
+  tft.fillTriangle(
+    39, 35,
+    48, 29,
+    48, 41,
+    ILI9341_BLACK
+  );
+
+  tutorialArrowVisible = true;
+}
+
+
+void drawTutorialTextPage(int page) {
+  tft.fillRect(
+    TUTORIAL_BOX_X,
+    TUTORIAL_BOX_Y,
+    TUTORIAL_BOX_W,
+    TUTORIAL_BOX_H,
+    ILI9341_BLACK
+  );
+
+  tft.setTextWrap(false);
+  tft.setTextSize(1);
+
+  const char* text = "";
+
+  if (activeTutorialMessage == TUTORIAL_ELEVATION) {
+    text = page == 0
+      ? "MATCH BOTH AIM INDICATORS!"
+      : "Use the LEFT elevation box.";
+  }
+  else if (activeTutorialMessage == TUTORIAL_SHIELD) {
+    // Center and color only the word RED.
+    const char* before = "Use ";
+    const char* redWord = "RED";
+    const char* after = " on shielded X-wings";
+    const int totalWidth =
+      (strlen(before) + strlen(redWord) + strlen(after)) * 6;
+    int x = TUTORIAL_BOX_X + (TUTORIAL_BOX_W - totalWidth) / 2;
+
+    tft.setCursor(x, TUTORIAL_BOX_Y + 3);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.print(before);
+    tft.setTextColor(ILI9341_RED);
+    tft.print(redWord);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.print(after);
+    return;
+  }
+  else if (activeTutorialMessage == TUTORIAL_RED_COOLDOWN) {
+    text = page == 0
+      ? "RED shots recharge more slowly."
+      : "Wait before pressing RED again.";
+  }
+  else if (activeTutorialMessage == TUTORIAL_BUTTON_LIGHTS) {
+    text = page == 0
+      ? "Watch the physical buttons."
+      : "The light shows RED is ready.";
+  }
+  else if (activeTutorialMessage == TUTORIAL_SPEED_BOOST) {
+    text = "Turbolaser speed boost!";
+  }
+
+  int16_t x1;
+  int16_t y1;
+  uint16_t w;
+  uint16_t h;
+  tft.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  tft.setTextColor(
+    activeTutorialMessage == TUTORIAL_RED_COOLDOWN && page == 0
+      ? ILI9341_RED
+      : ILI9341_WHITE
+  );
+  tft.setCursor(
+    TUTORIAL_BOX_X + (TUTORIAL_BOX_W - (int)w) / 2,
+    TUTORIAL_BOX_Y + 3
+  );
+  tft.print(text);
+}
+
+
+void showTutorialMessage(TutorialMessage message) {
+  if (
+    message == TUTORIAL_NONE ||
+    (selectedDifficulty != DIFFICULTY_NORMAL && message != TUTORIAL_SPEED_BOOST)
+  ) {
+    return;
+  }
+
+  if (activeTutorialMessage == TUTORIAL_ELEVATION) {
+    clearTutorialArrow();
+  }
+
+  activeTutorialMessage = message;
+  tutorialMessageStartedMs = millis();
+  tutorialArrowLastToggleMs = tutorialMessageStartedMs;
+  tutorialLastPage = -1;
+  tutorialArrowVisible = false;
+}
+
+
+void updateTutorialMessage() {
+  if (activeTutorialMessage == TUTORIAL_NONE) {
+    return;
+  }
+
+  unsigned long now = millis();
+  unsigned long elapsed = now - tutorialMessageStartedMs;
+
+  if (elapsed >= TUTORIAL_MESSAGE_DURATION_MS) {
+    if (activeTutorialMessage == TUTORIAL_ELEVATION) {
+      clearTutorialArrow();
+    }
+
+    restoreBackgroundRect(
+      TUTORIAL_BOX_X,
+      TUTORIAL_BOX_Y,
+      TUTORIAL_BOX_X + TUTORIAL_BOX_W - 1,
+      TUTORIAL_BOX_Y + TUTORIAL_BOX_H - 1
+    );
+
+    activeTutorialMessage = TUTORIAL_NONE;
+    tutorialLastPage = -1;
+    return;
+  }
+
+  int page = (elapsed / TUTORIAL_PAGE_DURATION_MS) % 2;
+  if (page != tutorialLastPage) {
+    drawTutorialTextPage(page);
+    tutorialLastPage = page;
+  }
+
+  if (
+    activeTutorialMessage == TUTORIAL_ELEVATION &&
+    now - tutorialArrowLastToggleMs >= TUTORIAL_ARROW_BLINK_MS
+  ) {
+    tutorialArrowLastToggleMs = now;
+    if (tutorialArrowVisible) {
+      clearTutorialArrow();
+    }
+    else {
+      drawTutorialArrow(true);
+    }
+  }
+}
+
+
+// ============================================================
 // HIT TEST
 // ============================================================
 
-bool shotHitsEnemy() {
+void getShotAlignment(bool& horizontalAligned, bool& verticalAligned) {
+  horizontalAligned = false;
+  verticalAligned =
+    abs(tickY - enemyElevationY) <= hitYThresholdPx;
 
   // Find where the player's white aim line crosses the ship's
   // current screen Y. Compare that X against the ship center X.
@@ -1993,7 +2522,7 @@ bool shotHitsEnemy() {
   float c = cos(rad);
 
   if (fabsf(c) < 0.001f) {
-    return false;
+    return;
   }
 
   float verticalDistance =
@@ -2011,7 +2540,7 @@ bool shotHitsEnemy() {
     distanceAlongAimLine < 0.0f ||
     distanceAlongAimLine > renderedAimLength + hitXThresholdPx
   ) {
-    return false;
+    return;
   }
 
   float aimXAtEnemyY =
@@ -2020,13 +2549,59 @@ bool shotHitsEnemy() {
   float xError =
     fabsf(aimXAtEnemyY - (float)enemyX);
 
-  int yError =
-    abs(tickY - enemyElevationY);
+  horizontalAligned = xError <= hitXThresholdPx;
+}
 
-  return (
-    xError <= hitXThresholdPx &&
-    yError <= hitYThresholdPx
-  );
+
+bool shotHitsEnemy() {
+  bool horizontalAligned;
+  bool verticalAligned;
+  getShotAlignment(horizontalAligned, verticalAligned);
+  return horizontalAligned && verticalAligned;
+}
+
+
+void getEnemy2ShotAlignment(bool& horizontalAligned, bool& verticalAligned) {
+  horizontalAligned = false;
+  verticalAligned =
+    abs(tickY - enemy2ElevationY) <= hitYThresholdPx;
+
+  float rad = radians(aimAngleDeg);
+  float c = cos(rad);
+  if (fabsf(c) < 0.001f) return;
+
+  float verticalDistance = (float)(BASE_Y - enemy2Y);
+  float distanceAlongAimLine = verticalDistance / c;
+  float renderedAimLength = computeLineLength(aimAngleDeg);
+  if (
+    distanceAlongAimLine < 0.0f ||
+    distanceAlongAimLine > renderedAimLength + hitXThresholdPx
+  ) return;
+
+  float aimXAtEnemyY =
+    (float)BASE_X + verticalDistance * tan(rad);
+  horizontalAligned =
+    fabsf(aimXAtEnemyY - (float)enemy2X) <= hitXThresholdPx;
+}
+
+
+bool shotHitsSpeedBoost() {
+  if (!speedBoostTargetActive) return false;
+
+  float rad = radians(aimAngleDeg);
+  float c = cos(rad);
+  if (fabsf(c) < 0.001f) return false;
+
+  float verticalDistance = (float)(BASE_Y - speedBoostY);
+  float distanceAlongAimLine = verticalDistance / c;
+  if (
+    distanceAlongAimLine < 0.0f ||
+    distanceAlongAimLine > computeLineLength(aimAngleDeg) + SPEED_BOOST_RADIUS
+  ) return false;
+
+  float aimXAtTargetY =
+    (float)BASE_X + verticalDistance * tan(rad);
+  return fabsf(aimXAtTargetY - (float)speedBoostX) <= SPEED_BOOST_RADIUS;
 }
 
 
@@ -2034,25 +2609,39 @@ bool shotHitsEnemy() {
 // BEGIN / UPDATE HIT FLICKER
 // ============================================================
 
-void beginEnemyHit(bool turnsGreen) {
+void beginEnemyHit(int damage) {
 
   if (enemyHitAnimating || gameOver) {
     return;
   }
 
-  enemyHitTurnsGreen = turnsGreen;
+  enemyHitWasShielded = enemyIsRed;
+  enemyHealth =
+    max(
+      0,
+      enemyHealth - damage
+    );
 
-  // A red-phase hit only strips the red state. Score is awarded when
-  // the green ship is actually destroyed.
-  if (!enemyHitTurnsGreen) {
-    score++;
-    drawScoreBox();
+  enemyHitDestroys =
+    (enemyHealth <= 0);
 
-    Serial.print("HIT! Score = ");
-    Serial.println(score);
+  // A shielded X-wing changes to the normal sprite only after its
+  // second 1-damage hit leaves it with exactly 1 HP.
+  enemyHitRemovesShield =
+    enemyIsRed &&
+    !enemyHitDestroys &&
+    enemyHealth == 1;
+
+  if (enemyHitDestroys) {
+    enemyHitFlickerIntervalMs = DESTROY_FLICKER_INTERVAL_MS;
+    enemyHitFlickerTransitions = DESTROY_FLICKER_TRANSITIONS;
+    Serial.println("LETHAL HIT! Beginning 1.5-second destruction sequence");
   }
   else {
-    Serial.println("RED HIT -> transitioning enemy to green");
+    enemyHitFlickerIntervalMs = DAMAGE_FLICKER_INTERVAL_MS;
+    enemyHitFlickerTransitions = DAMAGE_FLICKER_TRANSITIONS;
+    Serial.print("ENEMY HIT! Remaining HP = ");
+    Serial.println(enemyHealth);
   }
 
   enemyHitAnimating = true;
@@ -2072,7 +2661,7 @@ bool updateEnemyHitAnimation() {
 
   if (
     now - enemyHitLastToggleMs >=
-    HIT_FLICKER_INTERVAL_MS
+    enemyHitFlickerIntervalMs
   ) {
 
     enemyHitLastToggleMs = now;
@@ -2083,16 +2672,38 @@ bool updateEnemyHitAnimation() {
 
     if (
       enemyHitTransitionCount >=
-      HIT_FLICKER_TRANSITIONS
+      enemyHitFlickerTransitions
     ) {
 
       enemyVisibleDuringHit = false;
       enemyHitAnimating = false;
 
-      if (enemyHitTurnsGreen) {
-        // Keep the same ship and route position, but change it to green.
+      if (enemyHitDestroys) {
+        enemyHitDestroys = false;
+        enemyHitRemovesShield = false;
+
+        // Award the point after the final explosion phase finishes.
+        score++;
+        drawScoreBox();
+
+        Serial.print("ENEMY DESTROYED! Score = ");
+        Serial.println(score);
+
+        // Remove only this target. Two-target rounds do not advance until
+        // both ships have independently been destroyed or escaped.
+        primaryEnemyActive = false;
+        finishRoundIfReady();
+
+        previousEnemyUpdate = millis();
+
+        return true;
+      }
+
+      if (enemyHitRemovesShield) {
+        // Keep the same ship and route position, but reveal the normal
+        // X-wing sprite after the shield has taken two green hits.
         enemyIsRed = false;
-        enemyHitTurnsGreen = false;
+        enemyHitRemovesShield = false;
 
         // Green ships have a larger vertical wiggle than red ships.
         // Clamp this ship's randomized center into the GREEN-safe range so
@@ -2132,9 +2743,8 @@ bool updateEnemyHitAnimation() {
         return true;
       }
 
-      // Normal green hit: remove this ship and spawn the next route/ship.
-      resetEnemy();
-
+      // The shield still has 2 HP after its first green-button hit.
+      // Resume the same sprite and route without jumping ahead.
       previousEnemyUpdate = millis();
 
       return true;
@@ -2145,53 +2755,123 @@ bool updateEnemyHitAnimation() {
 }
 
 
-// ============================================================
-// DRAW HEALTH BAR
-//
-// This is NOT drawn every frame.
-// ============================================================
+void beginEnemy2Hit(int damage) {
+  if (enemy2HitAnimating || !enemy2Active || gameOver) return;
 
-void drawHealthBar() {
+  enemy2HitWasShielded = enemy2IsRed;
+  enemy2Health = max(0, enemy2Health - damage);
+  enemy2HitDestroys = enemy2Health <= 0;
+  enemy2HitRemovesShield =
+    enemy2IsRed && !enemy2HitDestroys && enemy2Health == 1;
 
-  restoreBackgroundRect(
-
-    HEALTH_BAR_X,
-    HEALTH_BAR_Y,
-
-    HEALTH_BAR_X
-      + HEALTH_BAR_WIDTH
-      - 1,
-
-    HEALTH_BAR_Y
-      + HEALTH_BAR_HEIGHT
-      - 1
-  );
+  enemy2HitFlickerIntervalMs = enemy2HitDestroys
+    ? DESTROY_FLICKER_INTERVAL_MS
+    : DAMAGE_FLICKER_INTERVAL_MS;
+  enemy2HitFlickerTransitions = enemy2HitDestroys
+    ? DESTROY_FLICKER_TRANSITIONS
+    : DAMAGE_FLICKER_TRANSITIONS;
+  enemy2HitAnimating = true;
+  enemy2VisibleDuringHit = false;
+  enemy2HitTransitionCount = 0;
+  enemy2HitLastToggleMs = millis();
+}
 
 
-  if (health <= 0) {
+void updateEnemy2HitAnimation() {
+  if (!enemy2HitAnimating) return;
 
+  unsigned long now = millis();
+  if (
+    now - enemy2HitLastToggleMs < enemy2HitFlickerIntervalMs
+  ) return;
+
+  enemy2HitLastToggleMs = now;
+  enemy2HitTransitionCount++;
+  enemy2VisibleDuringHit = !enemy2VisibleDuringHit;
+
+  if (enemy2HitTransitionCount < enemy2HitFlickerTransitions) return;
+
+  enemy2VisibleDuringHit = false;
+  enemy2HitAnimating = false;
+
+  if (enemy2HitDestroys) {
+    enemy2HitDestroys = false;
+    enemy2HitRemovesShield = false;
+    enemy2Active = false;
+    score++;
+    drawScoreBox();
+    finishRoundIfReady();
     return;
   }
 
+  if (enemy2HitRemovesShield) {
+    enemy2IsRed = false;
+    enemy2HitRemovesShield = false;
+  }
 
-  int remainingWidth =
-    (
-      HEALTH_BAR_WIDTH
-      * health
-    )
-    / MAX_HEALTH;
+  // Do not jump forward after a non-lethal animation.
+  previousEnemy2Update = millis();
+}
 
 
-  tft.fillRect(
+// ============================================================
+// DRAW PLAYER HEALTH HEARTS
+//
+// These are updated only when player health changes.
+// ============================================================
 
-    HEALTH_BAR_X,
-    HEALTH_BAR_Y,
+void drawHeart(int x, int y) {
 
-    remainingWidth,
-    HEALTH_BAR_HEIGHT,
-
+  tft.fillCircle(
+    x + 2,
+    y + 2,
+    2,
     ILI9341_RED
   );
+
+  tft.fillCircle(
+    x + 6,
+    y + 2,
+    2,
+    ILI9341_RED
+  );
+
+  tft.fillTriangle(
+    x,
+    y + 2,
+    x + 8,
+    y + 2,
+    x + 4,
+    y + 8,
+    ILI9341_RED
+  );
+}
+
+
+void drawHealthHearts() {
+
+  tft.fillRect(
+    HEARTS_BOX_X,
+    HEARTS_BOX_Y,
+    HEARTS_BOX_W,
+    HEARTS_BOX_H,
+    ILI9341_BLACK
+  );
+
+  tft.drawRect(
+    HEARTS_BOX_X,
+    HEARTS_BOX_Y,
+    HEARTS_BOX_W,
+    HEARTS_BOX_H,
+    ILI9341_WHITE
+  );
+
+  for (int i = 0; i < health; i++) {
+    drawHeart(
+      HEARTS_BOX_X + 6 + i * 13,
+      HEARTS_BOX_Y + 2
+    );
+  }
 }
 
 
@@ -2202,8 +2882,13 @@ void drawHealthBar() {
 void showGameOver() {
 
   gameOver = true;
+  currentGameElapsedMs = millis() - gameStartTime;
 
-  drawHealthBar();
+  // Remove the control signal from all three servos immediately. Sending
+  // neutral pulses can still allow an occasional twitch; FULL OFF cannot.
+  disableAllServoSignals();
+
+  drawHealthHearts();
 
   // Put a clean black panel over the middle of the gameplay screen.
   const int panelX = 55;
@@ -2281,6 +2966,8 @@ void showGameOver() {
   );
 
   tft.print(scoreLine);
+
+  finishGameOverFlow();
 }
 
 
@@ -2306,7 +2993,7 @@ void loseHealth() {
   }
 
 
-  drawHealthBar();
+  drawHealthHearts();
 
 
   if (health <= 0) {
@@ -2341,13 +3028,17 @@ bool updateEnemyPosition() {
 
   if (ENEMY_PATH_DURATION_SECONDS > 0.0f) {
 
-    // Ship 1 = 1.00x, ship 2 = 1.07x, ship 3 = 1.07^2, etc.
-    // This compounds the requested 7% increase from one ship to the next.
+    // The absolute round number keeps the 5% increase accumulating even
+    // when the 10-round pattern loops.
     float shipSpeedMultiplier =
       powf(
-        1.0f + ENEMY_SPEED_INCREASE_PER_SHIP,
+        1.0f + ENEMY_SPEED_INCREASE_PER_ROUND,
         (float)(enemyShipNumber - 1)
       );
+
+    if (roundHasTwoEnemies()) {
+      shipSpeedMultiplier *= MULTI_ENEMY_SPEED_MULTIPLIER;
+    }
 
     // Red ships travel slightly slower while they are in their red phase.
     // The wiggle calculations below are intentionally NOT multiplied by this.
@@ -2370,6 +3061,31 @@ bool updateEnemyPosition() {
   float baseY =
     enemyStartY +
     (enemyEndY - enemyStartY) * enemyPathProgress;
+
+  // Vertical routes and diagonals sway left/right. Pure side-to-side
+  // routes (3 and 4) bob up/down on the TFT instead.
+  const float wiggleEnvelope =
+    sinf(PI * enemyPathProgress);
+
+  const float horizontalWiggle =
+    sinf(TWO_PI * ENEMY_X_WIGGLE_FREQUENCY * elapsedSeconds)
+    * ENEMY_X_WIGGLE_AMPLITUDE
+    * wiggleEnvelope;
+
+  const float leftX =
+    RECT_LEFT + ENEMY_HALF_WIDTH + MARGIN + 1;
+
+  const float rightX =
+    RECT_RIGHT - ENEMY_HALF_WIDTH - MARGIN - 1;
+
+  if (enemyPathIndex == 3 || enemyPathIndex == 4) {
+    const float topY = RECT_TOP + ENEMY_HEIGHT / 2 + 2;
+    const float bottomY = RECT_BOTTOM - ENEMY_HEIGHT / 2 - 2;
+    baseY = constrain(baseY + horizontalWiggle, topY, bottomY);
+  }
+  else {
+    baseX = constrain(baseX + horizontalWiggle, leftX, rightX);
+  }
 
   enemyX = (int)roundf(baseX);
   enemyY = (int)roundf(baseY);
@@ -2548,8 +3264,159 @@ void configureEnemyPath() {
 }
 
 
+void randomizeEnemy2ElevationTarget() {
+  const int halfThickness = ENEMY_HEIGHT_LINE_THICKNESS / 2;
+  const float amplitude = enemy2IsRed
+    ? RED_ENEMY_ELEVATION_WIGGLE_AMPLITUDE
+    : GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE;
+  const int safeMin =
+    TICK_Y_MIN + halfThickness + (int)ceilf(amplitude);
+  const int safeMax =
+    TICK_Y_MAX - halfThickness - (int)ceilf(amplitude);
+
+  enemy2ElevationCenterY = safeMax > safeMin
+    ? (float)random(safeMin, safeMax + 1)
+    : (TICK_Y_MIN + TICK_Y_MAX) / 2.0f;
+  enemy2ElevationPhaseOffset =
+    ((float)random(0, 10000) / 10000.0f) * TWO_PI;
+}
+
+
+void configureEnemy2Path() {
+  randomizeEnemy2ElevationTarget();
+
+  const float leftX = RECT_LEFT + ENEMY_HALF_WIDTH + MARGIN + 1;
+  const float rightX = RECT_RIGHT - ENEMY_HALF_WIDTH - MARGIN - 1;
+  const float topY = RECT_TOP + ENEMY_HEIGHT / 2 + 2;
+  const float bottomY = RECT_BOTTOM - ENEMY_HEIGHT / 2 - 2;
+  const float middleX = (RECT_LEFT + RECT_RIGHT) / 2.0f;
+  const float middleY = (RECT_TOP + RECT_BOTTOM) / 2.0f;
+
+  switch (enemy2PathIndex) {
+    case 0:
+      enemy2StartX = middleX; enemy2StartY = topY;
+      enemy2EndX = middleX; enemy2EndY = bottomY;
+      break;
+    case 1:
+      enemy2StartX = leftX; enemy2StartY = topY;
+      enemy2EndX = rightX; enemy2EndY = bottomY;
+      break;
+    case 2:
+      enemy2StartX = rightX; enemy2StartY = topY;
+      enemy2EndX = leftX; enemy2EndY = bottomY;
+      break;
+    case 3:
+      enemy2StartX = leftX; enemy2StartY = middleY;
+      enemy2EndX = rightX; enemy2EndY = middleY;
+      break;
+    default:
+      enemy2StartX = rightX; enemy2StartY = middleY;
+      enemy2EndX = leftX; enemy2EndY = middleY;
+      break;
+  }
+
+  enemy2PathProgress = 0.0f;
+  enemy2X = (int)roundf(enemy2StartX);
+  enemy2Y = (int)roundf(enemy2StartY);
+  previousEnemy2Update = millis();
+}
+
+
+bool updateEnemy2Position() {
+  if (!enemy2Active) return false;
+
+  unsigned long now = millis();
+  float elapsedSeconds = (now - gameStartTime) / 1000.0f;
+  float deltaSeconds = (now - previousEnemy2Update) / 1000.0f;
+  previousEnemy2Update = now;
+
+  float speedMultiplier =
+    powf(
+      1.0f + ENEMY_SPEED_INCREASE_PER_ROUND,
+      (float)(enemyShipNumber - 1)
+    ) * MULTI_ENEMY_SPEED_MULTIPLIER;
+  if (enemy2IsRed) speedMultiplier *= RED_ENEMY_SPEED_MULTIPLIER;
+
+  enemy2PathProgress +=
+    (deltaSeconds / ENEMY_PATH_DURATION_SECONDS) * speedMultiplier;
+  enemy2PathProgress = constrain(enemy2PathProgress, 0.0f, 1.0f);
+
+  float baseX = enemy2StartX +
+    (enemy2EndX - enemy2StartX) * enemy2PathProgress;
+  float baseY = enemy2StartY +
+    (enemy2EndY - enemy2StartY) * enemy2PathProgress;
+  float wiggle =
+    sinf(TWO_PI * ENEMY_X_WIGGLE_FREQUENCY * elapsedSeconds + PI)
+    * ENEMY_X_WIGGLE_AMPLITUDE
+    * sinf(PI * enemy2PathProgress);
+
+  const float leftX = RECT_LEFT + ENEMY_HALF_WIDTH + MARGIN + 1;
+  const float rightX = RECT_RIGHT - ENEMY_HALF_WIDTH - MARGIN - 1;
+  const float topY = RECT_TOP + ENEMY_HEIGHT / 2 + 2;
+  const float bottomY = RECT_BOTTOM - ENEMY_HEIGHT / 2 - 2;
+
+  if (enemy2PathIndex == 3 || enemy2PathIndex == 4) {
+    baseY = constrain(baseY + wiggle, topY, bottomY);
+  }
+  else {
+    baseX = constrain(baseX + wiggle, leftX, rightX);
+  }
+
+  enemy2X = (int)roundf(baseX);
+  enemy2Y = (int)roundf(baseY);
+
+  float amplitude = enemy2IsRed
+    ? RED_ENEMY_ELEVATION_WIGGLE_AMPLITUDE
+    : GREEN_ENEMY_ELEVATION_WIGGLE_AMPLITUDE;
+  float frequency = enemy2IsRed
+    ? RED_ENEMY_ELEVATION_WIGGLE_FREQUENCY
+    : GREEN_ENEMY_ELEVATION_WIGGLE_FREQUENCY;
+  enemy2ElevationY = (int)(
+    enemy2ElevationCenterY +
+    sinf(TWO_PI * frequency * elapsedSeconds + enemy2ElevationPhaseOffset)
+      * amplitude
+  );
+  const int halfThickness = ENEMY_HEIGHT_LINE_THICKNESS / 2;
+  enemy2ElevationY = constrain(
+    enemy2ElevationY,
+    TICK_Y_MIN + halfThickness,
+    TICK_Y_MAX - halfThickness
+  );
+
+  return enemy2PathProgress >= 1.0f;
+}
+
+
+void spawnSpeedBoostTarget() {
+  speedBoostTargetActive = (enemyShipNumber == 6);
+  if (!speedBoostTargetActive) return;
+
+  // Choose a different edge region from the primary route whenever possible.
+  uint8_t side = (enemyPathIndex + random(1, 4)) % 4;
+  const int pad = SPEED_BOOST_RADIUS + 8;
+  if (side == 0) {
+    speedBoostX = random(RECT_LEFT + pad, RECT_RIGHT - pad);
+    speedBoostY = RECT_TOP + pad;
+  }
+  else if (side == 1) {
+    speedBoostX = RECT_RIGHT - pad;
+    speedBoostY = random(RECT_TOP + pad, RECT_BOTTOM - pad);
+  }
+  else if (side == 2) {
+    speedBoostX = random(RECT_LEFT + pad, RECT_RIGHT - pad);
+    speedBoostY = RECT_BOTTOM - pad;
+  }
+  else {
+    speedBoostX = RECT_LEFT + pad;
+    speedBoostY = random(RECT_TOP + pad, RECT_BOTTOM - pad);
+  }
+  prevSpeedBoostX = speedBoostX;
+  prevSpeedBoostY = speedBoostY;
+}
+
+
 // ============================================================
-// RESET ENEMY TO NEXT ROUTE
+// START THE NEXT ROUND
 // ============================================================
 
 void resetEnemy() {
@@ -2557,29 +3424,59 @@ void resetEnemy() {
   enemyShipNumber++;
   setEnemyColorForShipNumber();
 
+  primaryEnemyActive = true;
+
   enemyPathIndex =
     (enemyPathIndex + 1) % ENEMY_PATH_COUNT;
 
   configureEnemyPath();
 
+  enemy2Active = roundHasTwoEnemies();
+  // Round 7: both normal. Round 9: primary shielded, secondary normal.
+  enemy2IsRed = false;
+  enemy2Health = enemy2IsRed ? 3 : 1;
+  enemy2PathIndex = (enemyPathIndex + 2) % ENEMY_PATH_COUNT;
+  enemy2HitAnimating = false;
+  enemy2HitDestroys = false;
+  enemy2HitRemovesShield = false;
+  if (enemy2Active) configureEnemy2Path();
+
+  spawnSpeedBoostTarget();
+
   previousEnemyUpdate = millis();
 
   float shipSpeedMultiplier =
     powf(
-      1.0f + ENEMY_SPEED_INCREASE_PER_SHIP,
+      1.0f + ENEMY_SPEED_INCREASE_PER_ROUND,
       (float)(enemyShipNumber - 1)
     );
+
+  if (roundHasTwoEnemies()) {
+    shipSpeedMultiplier *= MULTI_ENEMY_SPEED_MULTIPLIER;
+  }
 
   if (enemyIsRed) {
     shipSpeedMultiplier *= RED_ENEMY_SPEED_MULTIPLIER;
   }
 
-  Serial.print("Ship ");
+  Serial.print("Round ");
   Serial.print(enemyShipNumber);
   Serial.print(enemyIsRed ? " RED" : " GREEN");
   Serial.print(" route speed = ");
   Serial.print(shipSpeedMultiplier, 3);
   Serial.println("x");
+}
+
+
+void finishRoundIfReady() {
+  if (!primaryEnemyActive && !enemy2Active &&
+      !enemyHitAnimating && !enemy2HitAnimating) {
+    if (speedBoostTargetActive) {
+      eraseSpeedBoostTarget();
+    }
+    speedBoostTargetActive = false;
+    resetEnemy();
+  }
 }
 
 
@@ -2589,24 +3486,13 @@ void resetEnemy() {
 
 void eraseOldEnemy() {
 
-  // Enemy triangle
+  // Clear the largest explosion footprint too, including after a shield
+  // transition or respawn. Keep restoration inside the playfield.
   restoreBackgroundRect(
-
-    prevEnemyX
-      - ENEMY_HALF_WIDTH
-      - 2,
-
-    prevEnemyY
-      - ENEMY_HEIGHT / 2
-      - 2,
-
-    prevEnemyX
-      + ENEMY_HALF_WIDTH
-      + 2,
-
-    prevEnemyY
-      + ENEMY_HEIGHT / 2
-      + 2
+    max(RECT_LEFT + 1, prevEnemyX - SHIELD_EXPLOSION_WIDTH / 2 - 2),
+    max(RECT_TOP + 1, prevEnemyY - SHIELD_EXPLOSION_HEIGHT / 2 - 2),
+    min(RECT_RIGHT - 1, prevEnemyX + SHIELD_EXPLOSION_WIDTH / 2 + 2),
+    min(RECT_BOTTOM - 1, prevEnemyY + SHIELD_EXPLOSION_HEIGHT / 2 + 2)
   );
 
 
@@ -2632,24 +3518,623 @@ void eraseOldEnemy() {
 }
 
 
+void eraseOldEnemy2() {
+  if (!roundHasTwoEnemies() && !enemy2HitAnimating) return;
+
+  restoreBackgroundRect(
+    max(RECT_LEFT + 1, prevEnemy2X - SHIELD_EXPLOSION_WIDTH / 2 - 2),
+    max(RECT_TOP + 1, prevEnemy2Y - SHIELD_EXPLOSION_HEIGHT / 2 - 2),
+    min(RECT_RIGHT - 1, prevEnemy2X + SHIELD_EXPLOSION_WIDTH / 2 + 2),
+    min(RECT_BOTTOM - 1, prevEnemy2Y + SHIELD_EXPLOSION_HEIGHT / 2 + 2)
+  );
+
+  int halfThickness = ENEMY_HEIGHT_LINE_THICKNESS / 2;
+  restoreBackgroundRect(
+    TICK_X_LEFT - 1,
+    prevEnemy2ElevationY - halfThickness - 2,
+    TICK_X_RIGHT + 1,
+    prevEnemy2ElevationY + halfThickness + 2
+  );
+}
+
+
+void eraseSpeedBoostTarget() {
+  restoreBackgroundRect(
+    max(RECT_LEFT + 1, prevSpeedBoostX - SPEED_BOOST_RADIUS - 2),
+    max(RECT_TOP + 1, prevSpeedBoostY - SPEED_BOOST_RADIUS - 2),
+    min(RECT_RIGHT - 1, prevSpeedBoostX + SPEED_BOOST_RADIUS + 2),
+    min(RECT_BOTTOM - 1, prevSpeedBoostY + SPEED_BOOST_RADIUS + 2)
+  );
+}
+
+
 // ============================================================
-// START SCREEN / DIFFICULTY MENU
+// PERSISTENT HIGH SCORES
+// ============================================================
+
+bool highScoreComesBefore(
+  uint32_t newScore,
+  uint32_t newTimeMs,
+  const HighScoreEntry& existing
+) {
+
+  if (existing.initials[0] == '\0') {
+    return true;
+  }
+
+  if (newScore != existing.score) {
+    return newScore > existing.score;
+  }
+
+  return newTimeMs < existing.timeMs;
+}
+
+
+void loadHighScores() {
+
+  memset(normalHighScores, 0, sizeof(normalHighScores));
+  memset(hardHighScores, 0, sizeof(hardHighScores));
+
+  highScoresReady =
+    highScorePreferences.begin(
+      HIGH_SCORE_NAMESPACE,
+      false
+    );
+
+  if (!highScoresReady) {
+    Serial.println("WARNING: high-score flash storage unavailable");
+    return;
+  }
+
+  if (
+    highScorePreferences.getBytesLength(NORMAL_SCORES_KEY) ==
+    sizeof(normalHighScores)
+  ) {
+    highScorePreferences.getBytes(
+      NORMAL_SCORES_KEY,
+      normalHighScores,
+      sizeof(normalHighScores)
+    );
+  }
+
+  if (
+    highScorePreferences.getBytesLength(HARD_SCORES_KEY) ==
+    sizeof(hardHighScores)
+  ) {
+    highScorePreferences.getBytes(
+      HARD_SCORES_KEY,
+      hardHighScores,
+      sizeof(hardHighScores)
+    );
+  }
+
+  for (int i = 0; i < HIGH_SCORE_COUNT; i++) {
+    normalHighScores[i].initials[3] = '\0';
+    hardHighScores[i].initials[3] = '\0';
+  }
+}
+
+
+HighScoreEntry* scoresForDifficulty(GameDifficulty difficulty) {
+  return
+    difficulty == DIFFICULTY_HARD
+      ? hardHighScores
+      : normalHighScores;
+}
+
+
+int qualifyingHighScoreIndex(
+  GameDifficulty difficulty,
+  uint32_t candidateScore,
+  uint32_t candidateTimeMs
+) {
+
+  HighScoreEntry* entries =
+    scoresForDifficulty(difficulty);
+
+  for (int i = 0; i < HIGH_SCORE_COUNT; i++) {
+    if (
+      highScoreComesBefore(
+        candidateScore,
+        candidateTimeMs,
+        entries[i]
+      )
+    ) {
+      return i;
+    }
+  }
+
+  return -1;
+}
+
+
+void insertHighScore(
+  GameDifficulty difficulty,
+  const char* initials,
+  uint32_t newScore,
+  uint32_t newTimeMs
+) {
+
+  int insertAt =
+    qualifyingHighScoreIndex(
+      difficulty,
+      newScore,
+      newTimeMs
+    );
+
+  if (insertAt < 0) {
+    return;
+  }
+
+  HighScoreEntry* entries =
+    scoresForDifficulty(difficulty);
+
+  for (int i = HIGH_SCORE_COUNT - 1; i > insertAt; i--) {
+    entries[i] = entries[i - 1];
+  }
+
+  memset(&entries[insertAt], 0, sizeof(HighScoreEntry));
+  strncpy(entries[insertAt].initials, initials, 3);
+  entries[insertAt].initials[3] = '\0';
+  entries[insertAt].score = newScore;
+  entries[insertAt].timeMs = newTimeMs;
+
+  if (highScoresReady) {
+    const char* key =
+      difficulty == DIFFICULTY_HARD
+        ? HARD_SCORES_KEY
+        : NORMAL_SCORES_KEY;
+
+    highScorePreferences.putBytes(
+      key,
+      entries,
+      sizeof(HighScoreEntry) * HIGH_SCORE_COUNT
+    );
+  }
+}
+
+
+void drawGreenReturnPrompt() {
+
+  const int y = 226;
+  const int x = 83;
+
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setCursor(x, y);
+  tft.print("press");
+
+  tft.fillCircle(
+    x + 37,
+    y + 3,
+    3,
+    ILI9341_GREEN
+  );
+
+  tft.setCursor(x + 46, y);
+  tft.print("to return to menu");
+}
+
+
+void drawHighScoreScreen(GameDifficulty difficulty) {
+
+  tft.fillScreen(ILI9341_BLACK);
+  tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_RED);
+
+  // Both headings are 21 characters at 12 pixels per character.
+  tft.setTextWrap(false);
+  tft.setTextSize(2);
+  tft.setCursor((tft.width() - 21 * 12) / 2, 10);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("HIGH SCORES: ");
+  tft.setTextColor(difficulty == DIFFICULTY_HARD ? ILI9341_RED : ILI9341_GREEN);
+  tft.print(difficulty == DIFFICULTY_HARD ? "HARD" : "EASY");
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print(" MODE");
+
+  HighScoreEntry* entries =
+    scoresForDifficulty(difficulty);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+
+  for (int i = 0; i < HIGH_SCORE_COUNT; i++) {
+    char line[28];
+
+    if (entries[i].initials[0] == '\0') {
+      snprintf(line, sizeof(line), "%d. ---     --", i + 1);
+    }
+    else {
+      snprintf(
+        line,
+        sizeof(line),
+        "%d. %-3s %6lu",
+        i + 1,
+        entries[i].initials,
+        (unsigned long)entries[i].score
+      );
+    }
+
+    tft.setCursor(66, 48 + i * 31);
+    tft.print(line);
+  }
+
+  tft.fillTriangle(12, 116, 20, 110, 20, 122, ILI9341_GREEN);
+  tft.fillTriangle(307, 116, 299, 110, 299, 122, ILI9341_GREEN);
+  drawGreenReturnPrompt();
+}
+
+
+void waitForAllControlsReleased() {
+  while (
+    digitalRead(PIN_UP) == LOW ||
+    digitalRead(PIN_DOWN) == LOW ||
+    digitalRead(PIN_LEFT) == LOW ||
+    digitalRead(PIN_RIGHT) == LOW ||
+    digitalRead(PIN_GREEN_BUTTON) == LOW ||
+    digitalRead(PIN_RED_BUTTON) == LOW
+  ) {
+    delay(5);
+  }
+  delay(40);
+}
+
+
+void showHighScoreBrowser(GameDifficulty shownDifficulty) {
+
+  waitForAllControlsReleased();
+
+  drawHighScoreScreen(shownDifficulty);
+
+  bool previousLeft = false;
+  bool previousRight = false;
+  bool previousGreen = false;
+
+  while (true) {
+    bool left = digitalRead(PIN_LEFT) == LOW;
+    bool right = digitalRead(PIN_RIGHT) == LOW;
+    bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+
+    if ((left && !previousLeft) || (right && !previousRight)) {
+      shownDifficulty =
+        shownDifficulty == DIFFICULTY_NORMAL
+          ? DIFFICULTY_HARD
+          : DIFFICULTY_NORMAL;
+
+      drawHighScoreScreen(shownDifficulty);
+    }
+
+    if (green && !previousGreen) {
+      waitForAllControlsReleased();
+      return;
+    }
+
+    previousLeft = left;
+    previousRight = right;
+    previousGreen = green;
+    delay(5);
+  }
+}
+
+
+const char* INITIAL_KEYS[28] = {
+  "A", "B", "C", "D", "E", "F", "G",
+  "H", "I", "J", "K", "L", "M", "N",
+  "O", "P", "Q", "R", "S", "T", "U",
+  "V", "W", "X", "Y", "Z", "<", "OK"
+};
+
+
+void drawInitialsKeyboard(
+  const char* initials,
+  int selectedKey
+) {
+
+  tft.fillScreen(ILI9341_BLACK);
+  drawCenteredMenuText("NEW HIGH SCORE", 5, 2, ILI9341_GREEN);
+
+  char initialsLine[20];
+  snprintf(
+    initialsLine,
+    sizeof(initialsLine),
+    "INITIALS: %c%c%c",
+    initials[0] ? initials[0] : '_',
+    initials[1] ? initials[1] : '_',
+    initials[2] ? initials[2] : '_'
+  );
+  drawCenteredMenuText(initialsLine, 29, 2, ILI9341_WHITE);
+
+  const int startX = 6;
+  const int startY = 60;
+  const int cellW = 44;
+  const int cellH = 34;
+
+  for (int i = 0; i < 28; i++) {
+    int col = i % 7;
+    int row = i / 7;
+    int x = startX + col * cellW;
+    int y = startY + row * cellH;
+    bool selected = (i == selectedKey);
+
+    tft.fillRect(
+      x,
+      y,
+      cellW - 3,
+      cellH - 3,
+      selected ? ILI9341_GREEN : ILI9341_BLACK
+    );
+    tft.drawRect(
+      x,
+      y,
+      cellW - 3,
+      cellH - 3,
+      selected ? ILI9341_WHITE : 0x7BEF
+    );
+
+    tft.setTextSize(2);
+    tft.setTextColor(
+      selected ? ILI9341_BLACK : ILI9341_WHITE,
+      selected ? ILI9341_GREEN : ILI9341_BLACK
+    );
+
+    int textOffset = strcmp(INITIAL_KEYS[i], "OK") == 0 ? 9 : 15;
+    tft.setCursor(x + textOffset, y + 8);
+    tft.print(INITIAL_KEYS[i]);
+  }
+
+  drawCenteredMenuText(
+    "green = select   red = cancel",
+    207,
+    1,
+    ILI9341_WHITE
+  );
+}
+
+
+bool enterHighScoreInitials(char initials[4]) {
+
+  memset(initials, 0, 4);
+  int initialsLength = 0;
+  int selectedKey = 0;
+
+  waitForAllControlsReleased();
+  drawInitialsKeyboard(initials, selectedKey);
+
+  bool previousUp = false;
+  bool previousDown = false;
+  bool previousLeft = false;
+  bool previousRight = false;
+  bool previousGreen = false;
+  bool previousRed = false;
+
+  while (true) {
+    bool up = digitalRead(PIN_UP) == LOW;
+    bool down = digitalRead(PIN_DOWN) == LOW;
+    bool left = digitalRead(PIN_LEFT) == LOW;
+    bool right = digitalRead(PIN_RIGHT) == LOW;
+    bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+    bool red = digitalRead(PIN_RED_BUTTON) == LOW;
+    bool changed = false;
+
+    if (red && !previousRed) {
+      // Cancel without returning any initials to the score insertion path.
+      waitForAllControlsReleased();
+      return false;
+    }
+
+    if (up && !previousUp) {
+      selectedKey = (selectedKey + 21) % 28;
+      changed = true;
+    }
+    if (down && !previousDown) {
+      selectedKey = (selectedKey + 7) % 28;
+      changed = true;
+    }
+    if (left && !previousLeft) {
+      selectedKey = (selectedKey + 27) % 28;
+      changed = true;
+    }
+    if (right && !previousRight) {
+      selectedKey = (selectedKey + 1) % 28;
+      changed = true;
+    }
+
+    if (green && !previousGreen) {
+      if (selectedKey < 26 && initialsLength < 3) {
+        initials[initialsLength++] = 'A' + selectedKey;
+        initials[initialsLength] = '\0';
+        if (initialsLength == 3) {
+          selectedKey = 27; // Highlight OK; the next green press confirms.
+        }
+        changed = true;
+      }
+      else if (selectedKey == 26 && initialsLength > 0) {
+        initials[--initialsLength] = '\0';
+        changed = true;
+      }
+      else if (selectedKey == 27 && initialsLength == 3) {
+        waitForAllControlsReleased();
+        return true;
+      }
+    }
+
+    if (changed) {
+      drawInitialsKeyboard(initials, selectedKey);
+    }
+
+    previousUp = up;
+    previousDown = down;
+    previousLeft = left;
+    previousRight = right;
+    previousGreen = green;
+    previousRed = red;
+    delay(5);
+  }
+}
+
+
+void waitForGreenThenRestart() {
+  waitForAllControlsReleased();
+
+  while (digitalRead(PIN_GREEN_BUTTON) == HIGH) {
+    delay(5);
+  }
+
+  delay(30);
+  ESP.restart();
+
+  while (true) {
+    delay(1000);
+  }
+}
+
+
+void finishGameOverFlow() {
+
+  // Duration was frozen at entry to showGameOver().
+
+  // Leave the completed GAME OVER screen visible briefly before changing
+  // to initials entry or showing the return prompt.
+  delay(1500);
+
+  int qualifyingIndex =
+    qualifyingHighScoreIndex(
+      selectedDifficulty,
+      (uint32_t)score,
+      currentGameElapsedMs
+    );
+
+  if (qualifyingIndex >= 0) {
+    char initials[4];
+    bool saveScore = enterHighScoreInitials(initials);
+
+    if (!saveScore) {
+      // Restarting returns to the main menu and deliberately skips both
+      // flash insertion and the post-game high-score browser.
+      ESP.restart();
+      return;
+    }
+
+    insertHighScore(
+      selectedDifficulty,
+      initials,
+      (uint32_t)score,
+      currentGameElapsedMs
+    );
+
+    showHighScoreBrowser(selectedDifficulty);
+    ESP.restart();
+    return;
+  }
+
+  drawGreenReturnPrompt();
+  waitForGreenThenRestart();
+}
+
+
+// ============================================================
+// PRE-GAME CENTER CALIBRATION
+// ============================================================
+
+void updateCalibrationServos() {
+  const bool left = digitalRead(PIN_LEFT) == LOW;
+  const bool right = digitalRead(PIN_RIGHT) == LOW;
+  const bool up = digitalRead(PIN_UP) == LOW;
+  const bool down = digitalRead(PIN_DOWN) == LOW;
+  // Deliberately bypass time-based gameplay limits. Neutral = no pulses.
+  setLRServoTicks(left != right ? (left ? LR_LEFT_TICKS : LR_RIGHT_TICKS) : 4096);
+  setUDServoTicks(up != down ? (up ? UD_UP_TICKS : UD_DOWN_TICKS) : 4096);
+}
+
+void drawCalibrationFrame(uint8_t frame) {
+  const uint16_t* data = CALIBRATION_FRAMES[frame];
+  uint16_t row[CALIBRATION_WIDTH];
+  uint32_t offset = 0;
+  uint16_t remaining = 0;
+  uint16_t color = 0;
+  for (int y = 0; y < CALIBRATION_HEIGHT; ++y) {
+    for (int x = 0; x < CALIBRATION_WIDTH; ++x) {
+      if (remaining == 0) {
+        remaining = pgm_read_word(data + offset++);
+        color = pgm_read_word(data + offset++);
+      }
+      row[x] = color;
+      --remaining;
+    }
+    tft.drawRGBBitmap(CALIBRATION_X, CALIBRATION_Y + y, row, CALIBRATION_WIDTH, 1);
+    // Keep joystick responsive even during an SPI image transfer.
+    if (digitalRead(PIN_GREEN_BUTTON) == LOW) {
+      setLRServoTicks(4096);
+      setUDServoTicks(4096);
+      return;
+    }
+    updateCalibrationServos();
+  }
+}
+
+void calibrateBeforeGame() {
+  disableAllServoSignals();
+  waitForAllControlsReleased();
+  tft.fillScreen(ILI9341_BLACK);
+  drawCenteredMenuText("Please center the turbolaser", 7, 1, ILI9341_WHITE);
+  drawCenteredMenuText("on both x and y axis.", 20, 1, ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(101, 220);
+  tft.print("Press");
+  tft.fillCircle(139, 223, 3, ILI9341_GREEN);
+  tft.setCursor(149, 220);
+  tft.print("when done.");
+  const unsigned long animationStart = millis();
+  int lastFrame = -1;
+  unsigned long confirmSince = 0;
+  bool confirming = false;
+  while (true) {
+    unsigned long now = millis();
+    if (digitalRead(PIN_GREEN_BUTTON) == LOW) {
+      setLRServoTicks(4096);
+      setUDServoTicks(4096);
+      if (!confirming) { confirming = true; confirmSince = now; }
+      if (now - confirmSince >= 30) {
+        gameStartTime = confirmSince;
+        disableAllServoSignals();
+        lrTravelPositionMs = 0;
+        udTravelPositionMs = 0;
+        // Do not let the confirmation press become a gameplay shot.
+        waitForAllControlsReleased();
+        return;
+      }
+    } else {
+      confirming = false;
+      updateCalibrationServos();
+      int frame = ((now - animationStart) / 250UL) % 8;
+      if (frame != lastFrame) {
+        drawCalibrationFrame(frame);
+        lastFrame = frame;
+      }
+    }
+    delay(1);
+  }
+}
+
+
+// ============================================================
+// START SCREEN / MAIN MENU
 // ============================================================
 //
 // Before the game starts:
 //   - TFT stays black
 //   - title says "TURBOLASER" inside a thicker red box
 //   - a red border surrounds the entire TFT
-//   - NORMAL is selected by default
-//   - joystick UP selects NORMAL (7 px)
-//   - joystick DOWN selects EASY (10 px)
-//   - selected option is green; the other is dim gray
-//   - either red or green button starts the selected difficulty
+//   - NORMAL is listed first and selected by default
+//   - HARD, HIGH SCORES follow underneath
+//   - joystick UP/DOWN changes the selected option
+//   - either red or green button activates the selected option
 //   - joystick does NOT move either continuous-rotation servo
 //   - SG90 animation does not play
 //
 // The continuous-rotation servos are commanded to their calibrated
-// stop values once so they remain stationary while waiting.
+// FULL OFF state while waiting.
 // ============================================================
 
 const uint16_t START_MENU_DIM_COLOR = 0x7BEF;  // medium gray in RGB565
@@ -2689,40 +4174,52 @@ void drawCenteredMenuText(
 }
 
 
-void drawDifficultyOptions() {
+void drawMainMenuOptions() {
 
-  // Restore only the menu-option area from the subtle background so
-  // changing difficulty does not disturb the title or instruction text.
   restoreStartMenuBackgroundRect(
     0,
-    135,
+    124,
     tft.width() - 1,
-    205
+    220
   );
 
   uint16_t normalColor =
-    (selectedDifficulty == DIFFICULTY_NORMAL)
+    (selectedMenuOption == MENU_NORMAL)
       ? ILI9341_GREEN
       : START_MENU_DIM_COLOR;
 
-  uint16_t easyColor =
-    (selectedDifficulty == DIFFICULTY_EASY)
+  uint16_t hardColor =
+    (selectedMenuOption == MENU_HARD)
       ? ILI9341_GREEN
       : START_MENU_DIM_COLOR;
+
+  uint16_t highScoresColor =
+    (selectedMenuOption == MENU_HIGH_SCORES)
+      ? ILI9341_GREEN
+      : START_MENU_DIM_COLOR;
+
 
   drawCenteredMenuText(
-    "Normal",
-    145,
+    "Easy",
+    130,
     1,
     normalColor
   );
 
   drawCenteredMenuText(
-    "Easy",
-    170,
+    "Hard",
+    151,
     1,
-    easyColor
+    hardColor
   );
+
+  drawCenteredMenuText(
+    "High Scores",
+    172,
+    1,
+    highScoresColor
+  );
+
 }
 
 
@@ -2796,21 +4293,21 @@ void drawStartScreen() {
 
   // Smaller instruction line.
   drawCenteredMenuText(
-    "press to start",
+    "select mode",
     105,
     2,
     ILI9341_WHITE
   );
 
-  drawDifficultyOptions();
+  drawMainMenuOptions();
 }
 
 
 void applySelectedDifficulty() {
 
-  if (selectedDifficulty == DIFFICULTY_EASY) {
-    hitXThresholdPx = EASY_HIT_THRESHOLD_PX;
-    hitYThresholdPx = EASY_HIT_THRESHOLD_PX;
+  if (selectedDifficulty == DIFFICULTY_HARD) {
+    hitXThresholdPx = HARD_HIT_THRESHOLD_PX;
+    hitYThresholdPx = HARD_HIT_THRESHOLD_PX;
   }
   else {
     hitXThresholdPx = NORMAL_HIT_THRESHOLD_PX;
@@ -2822,15 +4319,16 @@ void applySelectedDifficulty() {
 void waitForStartButton() {
 
   // Ignore the joystick for servo movement while waiting.
-  // Keep the movement servos parked at neutral.
-  stopJoystickServos();
+  // Keep all servo outputs fully off while waiting.
+  disableAllServoSignals();
 
+  selectedMenuOption = MENU_NORMAL;
   selectedDifficulty = DIFFICULTY_NORMAL;
   applySelectedDifficulty();
-  drawDifficultyOptions();
+  drawMainMenuOptions();
 
   Serial.println(
-    "Start menu: NORMAL selected (7 px). Use joystick UP/DOWN, then press a button to start."
+    "Main menu ready. Use joystick UP/DOWN and either button to select."
   );
 
   bool previousUp = false;
@@ -2846,36 +4344,26 @@ void waitForStartButton() {
 
     // Use edge detection so holding the joystick does not repeatedly redraw.
     if (upPressed && !previousUp) {
-
-      if (selectedDifficulty != DIFFICULTY_NORMAL) {
-        selectedDifficulty = DIFFICULTY_NORMAL;
-        applySelectedDifficulty();
-        drawDifficultyOptions();
-
-        Serial.println(
-          "Difficulty selected: NORMAL (7 px)"
+      selectedMenuOption =
+        (MainMenuOption)(
+          (selectedMenuOption + MENU_OPTION_COUNT - 1) %
+          MENU_OPTION_COUNT
         );
-      }
+      drawMainMenuOptions();
     }
 
     if (downPressed && !previousDown) {
-
-      if (selectedDifficulty != DIFFICULTY_EASY) {
-        selectedDifficulty = DIFFICULTY_EASY;
-        applySelectedDifficulty();
-        drawDifficultyOptions();
-
-        Serial.println(
-          "Difficulty selected: EASY (10 px)"
+      selectedMenuOption =
+        (MainMenuOption)(
+          (selectedMenuOption + 1) %
+          MENU_OPTION_COUNT
         );
-      }
+      drawMainMenuOptions();
     }
 
     previousUp = upPressed;
     previousDown = downPressed;
 
-    // Difficulty is now chosen by the menu, so either physical shot button
-    // can simply start the game.
     bool greenStart =
       (digitalRead(PIN_GREEN_BUTTON) == LOW);
 
@@ -2897,16 +4385,26 @@ void waitForStartButton() {
 
       delay(30);
 
+      if (selectedMenuOption == MENU_HIGH_SCORES) {
+        showHighScoreBrowser(DIFFICULTY_NORMAL);
+        drawStartScreen();
+        previousUp = false;
+        previousDown = false;
+        continue;
+      }
+
+      selectedDifficulty =
+        selectedMenuOption == MENU_HARD
+          ? DIFFICULTY_HARD
+          : DIFFICULTY_NORMAL;
+
       applySelectedDifficulty();
 
-      Serial.print("Game starting: ");
-
-      if (selectedDifficulty == DIFFICULTY_EASY) {
-        Serial.println("EASY, 10 px hit threshold");
-      }
-      else {
-        Serial.println("NORMAL, 7 px hit threshold");
-      }
+      Serial.println(
+        selectedDifficulty == DIFFICULTY_HARD
+          ? "Game starting: HARD, 7 px hit threshold"
+          : "Game starting: EASY, 10 px hit threshold"
+      );
 
       return;
     }
@@ -2925,6 +4423,8 @@ void setup() {
   Serial.begin(
     115200
   );
+
+  loadHighScores();
 
 
   // ==========================================================
@@ -3039,8 +4539,8 @@ void setup() {
   // while the start screen is showing.
 
   // Start both continuous-rotation joystick servos at their
-  // calibrated neutral/stop values.
-  stopJoystickServos();
+  // FULL OFF state (no control pulses).
+  disableAllServoSignals();
 
 
   // ==========================================================
@@ -3080,10 +4580,10 @@ void setup() {
 
   drawStartScreen();
 
-  // Nothing in the game runs until the player chooses NORMAL/EASY with
-  // the joystick and presses either shot button to start. The joystick is
-  // used only for menu selection here; the servos stay parked at neutral.
+  // Nothing in the game runs until the player chooses NORMAL or HARD.
+  // HIGH SCORES returns to the menu; both game modes require centering.
   waitForStartButton();
+  calibrateBeforeGame();
 
 
   // ==========================================================
@@ -3113,16 +4613,7 @@ void setup() {
   tickY = (TICK_Y_MIN + TICK_Y_MAX) / 2;
 
   // Replace the black start screen with the normal game bitmap.
-  tft.drawRGBBitmap(
-
-    0,
-    0,
-
-    backgroundBitmap,
-
-    BG_WIDTH,
-    BG_HEIGHT
-  );
+  drawGameplayBackground();
 
 
   // ==========================================================
@@ -3149,18 +4640,22 @@ void setup() {
   // ENEMY TIMING
   // ==========================================================
 
-  gameStartTime =
-    millis();
+  // gameStartTime was captured by the green calibration confirmation.
 
 
   previousEnemyUpdate =
-    gameStartTime;
+    millis();
 
 
   // The first ship always starts on route 0: top middle -> bottom middle.
   enemyPathIndex = 0;
   enemyShipNumber = 1;
   setEnemyColorForShipNumber();
+  primaryEnemyActive = true;
+  enemy2Active = false;
+  enemy2HitAnimating = false;
+  speedBoostTargetActive = false;
+  turbolaserSpeedBoostActive = false;
   configureEnemyPath();
 
   updateEnemyPosition();
@@ -3207,8 +4702,21 @@ void setup() {
   enemyHitAnimating = false;
   enemyVisibleDuringHit = true;
   enemyHitTransitionCount = 0;
+  enemyHitDestroys = false;
+  enemyHitRemovesShield = false;
 
-  drawHealthBar();
+  // Reset all one-game Easy-mode tutorial state.
+  activeTutorialMessage = TUTORIAL_NONE;
+  tutorialLastPage = -1;
+  tutorialArrowVisible = false;
+  lastElevationHintShipNumber = 0;
+  shieldHintShown = false;
+  redCooldownHintShown = false;
+  buttonLightsHintShown = false;
+  firstRedCooldownHintShipNumber = 0;
+  lastAcceptedRedOnShieldedShip = 0;
+
+  drawHealthHearts();
   drawScoreBox();
 
 
@@ -3322,6 +4830,23 @@ void loop() {
 
 
   // ==========================================================
+  // GAME OVER CONTROL MODE
+  // ==========================================================
+  // Buttons, LEDs, and audio may continue on Core 0, but return before
+  // any SG90 animation or joystick-servo command can be generated.
+  // All PCA9685 servo channels were placed in FULL OFF by showGameOver().
+
+  if (gameOver) {
+
+    delay(
+      10
+    );
+
+    return;
+  }
+
+
+  // ==========================================================
   // SG90 BUTTON ANIMATION
   //
   // Either ACCEPTED button press restarts the recoil animation.
@@ -3384,29 +4909,6 @@ void loop() {
   );
 
 
-  // ==========================================================
-  // GAME OVER CONTROL MODE
-  // ==========================================================
-  //
-  // After GAME OVER, the physical controls remain live:
-  //   - joystick still drives the LR and UD servos
-  //   - red/green buttons still run their normal LEDs/audio
-  //   - accepted button presses still trigger the SG90 animation
-  //
-  // But we return here before changing aimAngleDeg, tickY,
-  // enemy position, health, or any other gameplay state.
-  // ==========================================================
-
-  if (gameOver) {
-
-    delay(
-      10
-    );
-
-    return;
-  }
-
-
   bool aimChanged =
     false;
 
@@ -3452,13 +4954,13 @@ void loop() {
   // The physical UD turret tracks its estimated position as elapsed
   // movement time from the startup center:
   //
-  //   -1100 ms = full up   = TICK_Y_MIN
-  //       0 ms = center    = middle of the elevation bar
-  //   +1100 ms = full down = TICK_Y_MAX
+  //   -1000 ms = full up   = TICK_Y_MIN
+//       0 ms = center    = middle of the elevation bar
+  //   +1000 ms = full down = TICK_Y_MAX
   //
   // Both the physical servo limit and the TFT elevation marker use the
   // SAME udTravelPositionMs value, so a full top-to-bottom sweep takes
-  // exactly 2200 ms and the display stays synchronized with the
+  // exactly 2000 ms and the display stays synchronized with the
   // software-estimated physical turret position.
 
   float udNormalized =
@@ -3488,30 +4990,122 @@ void loop() {
   // ==========================================================
   // SHOOTING / HIT DETECTION
   // ==========================================================
-  // Red enemies can ONLY be advanced with the RED button.
-  // Once a red enemy is hit, it flickers twice and becomes green at the
-  // same route position. Green enemies keep the normal behavior and may
-  // be hit by either accepted gameplay button.
+  // Green-button shots deal 1 damage. Red-button shots deal 3 damage.
+  // Shielded X-wings have 3 HP and switch to the normal sprite after
+  // two green hits leave them at 1 HP. Normal X-wings have 1 HP.
   // Every hit still requires BOTH horizontal aim and elevation alignment.
 
-  bool correctShotButton = false;
+  int shotDamage = 0;
 
-  if (enemyIsRed) {
-    correctShotButton = redButtonPressedThisFrame;
+  if (redButtonPressedThisFrame) {
+    shotDamage = 3;
   }
-  else {
-    correctShotButton =
-      greenButtonPressedThisFrame ||
-      redButtonPressedThisFrame;
+  else if (greenButtonPressedThisFrame) {
+    shotDamage = 1;
+  }
+
+  bool shieldedTargetPresent =
+    (primaryEnemyActive && enemyIsRed) ||
+    (enemy2Active && enemy2IsRed);
+
+  // Remember which shielded round started the current red cooldown.
+  if (redButtonPressedThisFrame && shieldedTargetPresent) {
+    lastAcceptedRedOnShieldedShip = enemyShipNumber;
   }
 
   if (
-    !enemyHitAnimating &&
-    correctShotButton &&
-    shotHitsEnemy()
+    selectedDifficulty == DIFFICULTY_NORMAL &&
+    redButtonCooldownPressedThisFrame &&
+    shieldedTargetPresent &&
+    lastAcceptedRedOnShieldedShip == enemyShipNumber
   ) {
+    if (!redCooldownHintShown) {
+      redCooldownHintShown = true;
+      firstRedCooldownHintShipNumber = enemyShipNumber;
+      showTutorialMessage(TUTORIAL_RED_COOLDOWN);
+    }
+    else if (
+      !buttonLightsHintShown &&
+      enemyShipNumber != firstRedCooldownHintShipNumber
+    ) {
+      buttonLightsHintShown = true;
+      showTutorialMessage(TUTORIAL_BUTTON_LIGHTS);
+    }
+  }
 
-    beginEnemyHit(enemyIsRed);
+  if (
+    shotDamage > 0
+  ) {
+    // The S+ target requires horizontal/side-to-side aim only and consumes
+    // this shot before enemy hit-testing.
+    if (shotHitsSpeedBoost()) {
+      eraseSpeedBoostTarget();
+      speedBoostTargetActive = false;
+      turbolaserSpeedBoostActive = true;
+
+      // Apply the boost to the activating shot's cooldown as well as every
+      // later shot, so the benefit is immediately visible on the LEDs.
+      unsigned long boostNow = millis();
+      if ((long)(greenLedOffUntil - boostNow) > 0) {
+        greenLedOffUntil = boostNow + (unsigned long)(
+          (greenLedOffUntil - boostNow) * SPEED_BOOST_COOLDOWN_MULTIPLIER
+        );
+      }
+      if ((long)(redLedOffUntil - boostNow) > 0) {
+        redLedOffUntil = boostNow + (unsigned long)(
+          (redLedOffUntil - boostNow) * SPEED_BOOST_COOLDOWN_MULTIPLIER
+        );
+      }
+      greenButtonDisabledUntil = greenLedOffUntil + BUTTON_REARM_DELAY_MS;
+      redButtonDisabledUntil = redLedOffUntil + BUTTON_REARM_DELAY_MS;
+
+      showTutorialMessage(TUTORIAL_SPEED_BOOST);
+    }
+    else {
+      bool primaryHorizontal = false;
+      bool primaryVertical = false;
+      bool secondaryHorizontal = false;
+      bool secondaryVertical = false;
+
+      if (primaryEnemyActive && !enemyHitAnimating) {
+        getShotAlignment(primaryHorizontal, primaryVertical);
+      }
+      if (enemy2Active && !enemy2HitAnimating) {
+        getEnemy2ShotAlignment(secondaryHorizontal, secondaryVertical);
+      }
+
+      bool primaryHit = primaryHorizontal && primaryVertical;
+      bool secondaryHit = secondaryHorizontal && secondaryVertical;
+
+      // Easy-mode hints explain the relevant mistake without pausing play.
+      if (selectedDifficulty == DIFFICULTY_NORMAL) {
+        if (
+          enemyShipNumber <= 2 &&
+          ((primaryHorizontal && !primaryVertical) ||
+           (secondaryHorizontal && !secondaryVertical)) &&
+          lastElevationHintShipNumber != enemyShipNumber
+        ) {
+          lastElevationHintShipNumber = enemyShipNumber;
+          showTutorialMessage(TUTORIAL_ELEVATION);
+        }
+
+        if (
+          enemyShipNumber == 3 &&
+          greenButtonPressedThisFrame &&
+          !shieldHintShown
+        ) {
+          shieldHintShown = true;
+          showTutorialMessage(TUTORIAL_SHIELD);
+        }
+      }
+
+      if (primaryHit) {
+        beginEnemyHit(shotDamage);
+      }
+      else if (secondaryHit) {
+        beginEnemy2Hit(shotDamage);
+      }
+    }
   }
 
 
@@ -3520,6 +5114,7 @@ void loop() {
   // ==========================================================
 
   eraseOldEnemy();
+  eraseOldEnemy2();
 
 
   if (aimChanged) {
@@ -3555,17 +5150,25 @@ void loop() {
   // ==========================================================
 
   bool enemyEscaped = false;
+  bool enemy2Escaped = false;
 
-  if (enemyHitAnimating) {
+  if (primaryEnemyActive && enemyHitAnimating) {
 
-    // Freeze the ship while it flickers. This routine resets the
-    // enemy on the next route automatically after two quick flickers.
+    // Freeze only the enemy while it flickers. Player joystick, buttons,
+    // audio, LEDs, and recoil animation continue operating above.
     updateEnemyHitAnimation();
   }
-  else {
+  else if (primaryEnemyActive) {
 
     enemyEscaped =
       updateEnemyPosition();
+  }
+
+  if (enemy2Active && enemy2HitAnimating) {
+    updateEnemy2HitAnimation();
+  }
+  else if (enemy2Active) {
+    enemy2Escaped = updateEnemy2Position();
   }
 
 
@@ -3584,7 +5187,19 @@ void loop() {
     }
 
 
-    resetEnemy();
+    primaryEnemyActive = false;
+    finishRoundIfReady();
+  }
+
+  if (enemy2Escaped) {
+    loseHealth();
+
+    if (gameOver) {
+      return;
+    }
+
+    enemy2Active = false;
+    finishRoundIfReady();
   }
 
 
@@ -3593,8 +5208,8 @@ void loop() {
   // ==========================================================
 
   if (
-    !enemyHitAnimating ||
-    enemyVisibleDuringHit
+    primaryEnemyActive &&
+    (!enemyHitAnimating || enemyVisibleDuringHit)
   ) {
 
     drawEnemyShip(
@@ -3606,6 +5221,23 @@ void loop() {
     drawEnemyElevation(
       enemyElevationY
     );
+  }
+  else if (primaryEnemyActive && enemyHitAnimating) {
+    // Alternate the ship with an explosion instead of a blank phase.
+    drawEnemyExplosion(enemyX, enemyY);
+    drawEnemyElevation(enemyElevationY);
+  }
+
+  if (
+    enemy2Active &&
+    (!enemy2HitAnimating || enemy2VisibleDuringHit)
+  ) {
+    drawEnemyShipAt(enemy2X, enemy2Y, enemy2IsRed);
+    drawEnemyElevationAt(enemy2ElevationY, enemy2IsRed);
+  }
+  else if (enemy2Active && enemy2HitAnimating) {
+    drawEnemyExplosionAt(enemy2X, enemy2Y, enemy2HitWasShielded);
+    drawEnemyElevationAt(enemy2ElevationY, enemy2IsRed);
   }
 
 
@@ -3621,6 +5253,10 @@ void loop() {
   drawTick(
     tickY
   );
+
+  // The stationary pickup is drawn after moving graphics so it remains
+  // visible if an X-wing or aim-line restoration crosses its area.
+  drawSpeedBoostTarget();
 
 
   // ==========================================================
@@ -3653,6 +5289,17 @@ void loop() {
 
   prevEnemyElevationY =
     enemyElevationY;
+
+  if (enemy2Active || enemy2HitAnimating) {
+    prevEnemy2X = enemy2X;
+    prevEnemy2Y = enemy2Y;
+    prevEnemy2ElevationY = enemy2ElevationY;
+  }
+
+
+  // Tutorial graphics are updated last so they remain legible while all
+  // normal gameplay drawing and controls continue underneath.
+  updateTutorialMessage();
 
 
   // ==========================================================
