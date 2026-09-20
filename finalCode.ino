@@ -204,9 +204,9 @@ const uint16_t LR_LEFT_TICKS  = 351;
 const uint16_t LR_STOP_TICKS  = 370;
 const uint16_t LR_RIGHT_TICKS = 381;
 
-const uint16_t UD_UP_TICKS    = 390;
+const uint16_t UD_UP_TICKS    = 395;
 const uint16_t UD_STOP_TICKS  = 369;
-const uint16_t UD_DOWN_TICKS  = 353;
+const uint16_t UD_DOWN_TICKS  = 354;
 
 // Cache the last command so we do not repeatedly rewrite the same
 // PCA9685 value every frame. -1 means no command has been sent yet.
@@ -726,6 +726,7 @@ struct HighScoreEntry {
 
 HighScoreEntry normalHighScores[HIGH_SCORE_COUNT];
 HighScoreEntry hardHighScores[HIGH_SCORE_COUNT];
+HighScoreEntry editableHighScores[HIGH_SCORE_COUNT];
 Preferences highScorePreferences;
 bool highScoresReady = false;
 
@@ -754,6 +755,20 @@ void insertHighScore(
 );
 void drawHighScoreScreen(GameDifficulty difficulty);
 void showHighScoreBrowser(GameDifficulty shownDifficulty);
+bool showHighScoreEditor(GameDifficulty difficulty);
+bool enterHighScoreInitials(char initials[4]);
+void saveHighScoresForDifficulty(GameDifficulty difficulty);
+void sortEditableHighScores();
+void drawHighScoreEditorScreen(
+  GameDifficulty difficulty,
+  int selectedItem
+);
+int chooseHighScoreAction(
+  const char* initials
+);
+bool confirmDeleteHighScore(
+  const char* initials
+);
 void drawCenteredMenuText(
   const char* text,
   int16_t y,
@@ -3623,6 +3638,22 @@ HighScoreEntry* scoresForDifficulty(GameDifficulty difficulty) {
 }
 
 
+void saveHighScoresForDifficulty(GameDifficulty difficulty) {
+  if (!highScoresReady) return;
+
+  const char* key =
+    difficulty == DIFFICULTY_HARD
+      ? HARD_SCORES_KEY
+      : NORMAL_SCORES_KEY;
+
+  highScorePreferences.putBytes(
+    key,
+    scoresForDifficulty(difficulty),
+    sizeof(HighScoreEntry) * HIGH_SCORE_COUNT
+  );
+}
+
+
 int qualifyingHighScoreIndex(
   GameDifficulty difficulty,
   uint32_t candidateScore,
@@ -3679,18 +3710,7 @@ void insertHighScore(
   entries[insertAt].score = newScore;
   entries[insertAt].timeMs = newTimeMs;
 
-  if (highScoresReady) {
-    const char* key =
-      difficulty == DIFFICULTY_HARD
-        ? HARD_SCORES_KEY
-        : NORMAL_SCORES_KEY;
-
-    highScorePreferences.putBytes(
-      key,
-      entries,
-      sizeof(HighScoreEntry) * HIGH_SCORE_COUNT
-    );
-  }
+  saveHighScoresForDifficulty(difficulty);
 }
 
 
@@ -3788,14 +3808,40 @@ void showHighScoreBrowser(GameDifficulty shownDifficulty) {
 
   bool previousLeft = false;
   bool previousRight = false;
+  bool previousUp = false;
+  bool previousDown = false;
   bool previousGreen = false;
+  int consecutiveUpPresses = 0;
 
   while (true) {
     bool left = digitalRead(PIN_LEFT) == LOW;
     bool right = digitalRead(PIN_RIGHT) == LOW;
+    bool up = digitalRead(PIN_UP) == LOW;
+    bool down = digitalRead(PIN_DOWN) == LOW;
     bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
 
+    if (up && !previousUp) {
+      consecutiveUpPresses++;
+
+      if (consecutiveUpPresses >= 5) {
+        waitForAllControlsReleased();
+        bool savedAndExit = showHighScoreEditor(shownDifficulty);
+
+        if (savedAndExit) {
+          return;
+        }
+
+        consecutiveUpPresses = 0;
+        drawHighScoreScreen(shownDifficulty);
+      }
+    }
+
+    if (down && !previousDown) {
+      consecutiveUpPresses = 0;
+    }
+
     if ((left && !previousLeft) || (right && !previousRight)) {
+      consecutiveUpPresses = 0;
       shownDifficulty =
         shownDifficulty == DIFFICULTY_NORMAL
           ? DIFFICULTY_HARD
@@ -3805,12 +3851,15 @@ void showHighScoreBrowser(GameDifficulty shownDifficulty) {
     }
 
     if (green && !previousGreen) {
+      consecutiveUpPresses = 0;
       waitForAllControlsReleased();
       return;
     }
 
     previousLeft = left;
     previousRight = right;
+    previousUp = up;
+    previousDown = down;
     previousGreen = green;
     delay(5);
   }
@@ -3968,6 +4017,446 @@ bool enterHighScoreInitials(char initials[4]) {
     previousRight = right;
     previousGreen = green;
     previousRed = red;
+    delay(5);
+  }
+}
+
+
+void sortEditableHighScores() {
+  for (int i = 0; i < HIGH_SCORE_COUNT - 1; i++) {
+    for (int j = i + 1; j < HIGH_SCORE_COUNT; j++) {
+      bool jBeforeI = false;
+
+      if (editableHighScores[j].initials[0] != '\0') {
+        jBeforeI =
+          editableHighScores[i].initials[0] == '\0' ||
+          highScoreComesBefore(
+            editableHighScores[j].score,
+            editableHighScores[j].timeMs,
+            editableHighScores[i]
+          );
+      }
+
+      if (jBeforeI) {
+        HighScoreEntry temp = editableHighScores[i];
+        editableHighScores[i] = editableHighScores[j];
+        editableHighScores[j] = temp;
+      }
+    }
+  }
+}
+
+
+void drawHighScoreEditorScreen(
+  GameDifficulty difficulty,
+  int selectedItem
+) {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_RED);
+  drawCenteredMenuText("HIGH SCORES: EDIT MODE", 5, 2, ILI9341_WHITE);
+  drawCenteredMenuText(
+    difficulty == DIFFICULTY_HARD ? "HARD" : "EASY",
+    25,
+    1,
+    difficulty == DIFFICULTY_HARD ? ILI9341_RED : ILI9341_GREEN
+  );
+
+  for (int i = 0; i < HIGH_SCORE_COUNT; i++) {
+    const int y = 42 + i * 21;
+    bool selected = selectedItem == i;
+    tft.fillRect(34, y - 3, 252, 17, selected ? ILI9341_GREEN : ILI9341_BLACK);
+    tft.setTextSize(1);
+    tft.setTextColor(
+      selected ? ILI9341_BLACK : ILI9341_WHITE,
+      selected ? ILI9341_GREEN : ILI9341_BLACK
+    );
+    tft.setCursor(42, y);
+
+    if (editableHighScores[i].initials[0] == '\0') {
+      char line[32];
+      snprintf(line, sizeof(line), "%d. ---  ------  --:--", i + 1);
+      tft.print(line);
+    }
+    else {
+      uint32_t totalSeconds = editableHighScores[i].timeMs / 1000UL;
+      uint32_t minutes = min(99UL, totalSeconds / 60UL);
+      uint32_t seconds = totalSeconds % 60UL;
+      char line[40];
+      snprintf(
+        line,
+        sizeof(line),
+        "%d. %-3s  %6lu  %02lu:%02lu",
+        i + 1,
+        editableHighScores[i].initials,
+        (unsigned long)editableHighScores[i].score,
+        (unsigned long)minutes,
+        (unsigned long)seconds
+      );
+      tft.print(line);
+    }
+  }
+
+  const char* options[3] = { "ADD SCORE", "SAVE", "CANCEL" };
+  const int optionY[3] = { 158, 187, 214 };
+  for (int i = 0; i < 3; i++) {
+    bool selected = selectedItem == HIGH_SCORE_COUNT + i;
+    tft.fillRect(80, optionY[i] - 4, 160, 22,
+      selected ? ILI9341_GREEN : ILI9341_BLACK);
+    drawCenteredMenuText(
+      options[i],
+      optionY[i],
+      2,
+      selected ? ILI9341_BLACK : ILI9341_WHITE
+    );
+  }
+}
+
+
+int chooseHighScoreAction(const char* initials) {
+  int selected = 0;
+  waitForAllControlsReleased();
+
+  while (true) {
+    tft.fillScreen(ILI9341_BLACK);
+    drawCenteredMenuText(initials, 35, 3, ILI9341_WHITE);
+
+    const char* options[2] = { "EDIT SCORE", "DELETE SCORE" };
+    for (int i = 0; i < 2; i++) {
+      bool active = selected == i;
+      int y = 95 + i * 50;
+      tft.fillRect(55, y - 8, 210, 34,
+        active ? ILI9341_GREEN : ILI9341_BLACK);
+      drawCenteredMenuText(
+        options[i], y, 2,
+        active ? ILI9341_BLACK : ILI9341_WHITE
+      );
+    }
+    drawCenteredMenuText("red = back", 218, 1, ILI9341_WHITE);
+
+    bool previousUp = false;
+    bool previousDown = false;
+    bool previousGreen = false;
+    bool previousRed = false;
+
+    while (true) {
+      bool up = digitalRead(PIN_UP) == LOW;
+      bool down = digitalRead(PIN_DOWN) == LOW;
+      bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+      bool red = digitalRead(PIN_RED_BUTTON) == LOW;
+
+      if ((up && !previousUp) || (down && !previousDown)) {
+        selected = 1 - selected;
+        waitForAllControlsReleased();
+        break;
+      }
+      if (green && !previousGreen) {
+        waitForAllControlsReleased();
+        return selected;
+      }
+      if (red && !previousRed) {
+        waitForAllControlsReleased();
+        return -1;
+      }
+
+      previousUp = up;
+      previousDown = down;
+      previousGreen = green;
+      previousRed = red;
+      delay(5);
+    }
+  }
+}
+
+
+bool confirmDeleteHighScore(const char* initials) {
+  waitForAllControlsReleased();
+  tft.fillScreen(ILI9341_BLACK);
+  drawCenteredMenuText("ARE YOU SURE?", 65, 3, ILI9341_RED);
+  drawCenteredMenuText(initials, 110, 3, ILI9341_WHITE);
+  drawCenteredMenuText("green = delete", 175, 2, ILI9341_GREEN);
+  drawCenteredMenuText("red = cancel", 210, 1, ILI9341_WHITE);
+
+  bool previousGreen = false;
+  bool previousRed = false;
+  while (true) {
+    bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+    bool red = digitalRead(PIN_RED_BUTTON) == LOW;
+    if (green && !previousGreen) {
+      waitForAllControlsReleased();
+      return true;
+    }
+    if (red && !previousRed) {
+      waitForAllControlsReleased();
+      return false;
+    }
+    previousGreen = green;
+    previousRed = red;
+    delay(5);
+  }
+}
+
+
+void drawManualScoreEditor(
+  const char* initials,
+  const uint8_t digits[10],
+  int selectedDigit,
+  bool adding
+) {
+  tft.fillScreen(ILI9341_BLACK);
+  drawCenteredMenuText(
+    adding ? "ADD SCORE" : "EDIT SCORE",
+    12,
+    2,
+    ILI9341_WHITE
+  );
+  drawCenteredMenuText(initials, 38, 2, ILI9341_GREEN);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setCursor(20, 83);
+  tft.print("SCORE:");
+  tft.setCursor(20, 137);
+  tft.print("TIME:");
+
+  for (int i = 0; i < 10; i++) {
+    int x;
+    int y;
+    if (i < 6) {
+      x = 112 + i * 20;
+      y = 83;
+    }
+    else {
+      int timeIndex = i - 6;
+      x = 128 + timeIndex * 24 + (timeIndex >= 2 ? 12 : 0);
+      y = 137;
+    }
+
+    bool selected = i == selectedDigit;
+    tft.fillRect(x - 2, y - 3, 17, 23,
+      selected ? ILI9341_GREEN : ILI9341_BLACK);
+    tft.setTextColor(
+      selected ? ILI9341_BLACK : ILI9341_WHITE,
+      selected ? ILI9341_GREEN : ILI9341_BLACK
+    );
+    tft.setCursor(x, y);
+    tft.print(digits[i]);
+  }
+
+  tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
+  tft.setCursor(178, 137);
+  tft.print(":");
+  drawCenteredMenuText("left/right = digit   up/down = value", 187, 1, ILI9341_WHITE);
+  drawCenteredMenuText("green = done   red = cancel", 211, 1, ILI9341_WHITE);
+}
+
+
+bool editManualScoreAndTime(
+  const char* initials,
+  uint32_t& editedScore,
+  uint32_t& editedTimeMs,
+  bool adding
+) {
+  uint8_t digits[10] = {0};
+  uint32_t scoreValue = min(999999UL, editedScore);
+  for (int i = 5; i >= 0; i--) {
+    digits[i] = scoreValue % 10;
+    scoreValue /= 10;
+  }
+
+  uint32_t totalSeconds = editedTimeMs / 1000UL;
+  uint32_t minutes = min(99UL, totalSeconds / 60UL);
+  uint32_t seconds = totalSeconds % 60UL;
+  digits[6] = minutes / 10;
+  digits[7] = minutes % 10;
+  digits[8] = seconds / 10;
+  digits[9] = seconds % 10;
+
+  int selectedDigit = 0;
+  waitForAllControlsReleased();
+  drawManualScoreEditor(initials, digits, selectedDigit, adding);
+
+  bool previousUp = false;
+  bool previousDown = false;
+  bool previousLeft = false;
+  bool previousRight = false;
+  bool previousGreen = false;
+  bool previousRed = false;
+
+  while (true) {
+    bool up = digitalRead(PIN_UP) == LOW;
+    bool down = digitalRead(PIN_DOWN) == LOW;
+    bool left = digitalRead(PIN_LEFT) == LOW;
+    bool right = digitalRead(PIN_RIGHT) == LOW;
+    bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+    bool red = digitalRead(PIN_RED_BUTTON) == LOW;
+    bool changed = false;
+
+    if (left && !previousLeft) {
+      selectedDigit = (selectedDigit + 9) % 10;
+      changed = true;
+    }
+    if (right && !previousRight) {
+      selectedDigit = (selectedDigit + 1) % 10;
+      changed = true;
+    }
+    if ((up && !previousUp) || (down && !previousDown)) {
+      int maximum = selectedDigit == 8 ? 5 : 9;
+      if (up && !previousUp) {
+        digits[selectedDigit] = (digits[selectedDigit] + 1) % (maximum + 1);
+      }
+      else {
+        digits[selectedDigit] =
+          (digits[selectedDigit] + maximum) % (maximum + 1);
+      }
+      changed = true;
+    }
+
+    if (green && !previousGreen) {
+      editedScore = 0;
+      for (int i = 0; i < 6; i++) {
+        editedScore = editedScore * 10UL + digits[i];
+      }
+      uint32_t editedMinutes = digits[6] * 10UL + digits[7];
+      uint32_t editedSeconds = digits[8] * 10UL + digits[9];
+      editedTimeMs = (editedMinutes * 60UL + editedSeconds) * 1000UL;
+      waitForAllControlsReleased();
+      return true;
+    }
+    if (red && !previousRed) {
+      waitForAllControlsReleased();
+      return false;
+    }
+
+    if (changed) {
+      drawManualScoreEditor(initials, digits, selectedDigit, adding);
+    }
+
+    previousUp = up;
+    previousDown = down;
+    previousLeft = left;
+    previousRight = right;
+    previousGreen = green;
+    previousRed = red;
+    delay(5);
+  }
+}
+
+
+bool showHighScoreEditor(GameDifficulty difficulty) {
+  memcpy(
+    editableHighScores,
+    scoresForDifficulty(difficulty),
+    sizeof(editableHighScores)
+  );
+  int selectedItem = 0;
+
+  waitForAllControlsReleased();
+  drawHighScoreEditorScreen(difficulty, selectedItem);
+
+  bool previousUp = false;
+  bool previousDown = false;
+  bool previousGreen = false;
+
+  while (true) {
+    bool up = digitalRead(PIN_UP) == LOW;
+    bool down = digitalRead(PIN_DOWN) == LOW;
+    bool green = digitalRead(PIN_GREEN_BUTTON) == LOW;
+
+    if (up && !previousUp) {
+      selectedItem = (selectedItem + HIGH_SCORE_COUNT + 2) %
+        (HIGH_SCORE_COUNT + 3);
+      drawHighScoreEditorScreen(difficulty, selectedItem);
+    }
+    if (down && !previousDown) {
+      selectedItem = (selectedItem + 1) % (HIGH_SCORE_COUNT + 3);
+      drawHighScoreEditorScreen(difficulty, selectedItem);
+    }
+
+    if (green && !previousGreen) {
+      waitForAllControlsReleased();
+
+      if (selectedItem < HIGH_SCORE_COUNT) {
+        if (editableHighScores[selectedItem].initials[0] != '\0') {
+          int action = chooseHighScoreAction(
+            editableHighScores[selectedItem].initials
+          );
+
+          if (action == 0) {
+            uint32_t editedScore = editableHighScores[selectedItem].score;
+            uint32_t editedTime = editableHighScores[selectedItem].timeMs;
+            if (editManualScoreAndTime(
+              editableHighScores[selectedItem].initials,
+              editedScore,
+              editedTime,
+              false
+            )) {
+              editableHighScores[selectedItem].score = editedScore;
+              editableHighScores[selectedItem].timeMs = editedTime;
+              sortEditableHighScores();
+            }
+          }
+          else if (
+            action == 1 &&
+            confirmDeleteHighScore(editableHighScores[selectedItem].initials)
+          ) {
+            for (int i = selectedItem; i < HIGH_SCORE_COUNT - 1; i++) {
+              editableHighScores[i] = editableHighScores[i + 1];
+            }
+            memset(
+              &editableHighScores[HIGH_SCORE_COUNT - 1],
+              0,
+              sizeof(HighScoreEntry)
+            );
+          }
+        }
+      }
+      else if (selectedItem == HIGH_SCORE_COUNT) {
+        char initials[4];
+        if (enterHighScoreInitials(initials)) {
+          uint32_t newScore = 0;
+          uint32_t newTime = 0;
+          if (editManualScoreAndTime(initials, newScore, newTime, true)) {
+            int destination = HIGH_SCORE_COUNT - 1;
+            for (int i = 0; i < HIGH_SCORE_COUNT; i++) {
+              if (editableHighScores[i].initials[0] == '\0') {
+                destination = i;
+                break;
+              }
+            }
+            memset(&editableHighScores[destination], 0, sizeof(HighScoreEntry));
+            strncpy(editableHighScores[destination].initials, initials, 3);
+            editableHighScores[destination].initials[3] = '\0';
+            editableHighScores[destination].score = newScore;
+            editableHighScores[destination].timeMs = newTime;
+            sortEditableHighScores();
+          }
+        }
+      }
+      else if (selectedItem == HIGH_SCORE_COUNT + 1) {
+        memcpy(
+          scoresForDifficulty(difficulty),
+          editableHighScores,
+          sizeof(editableHighScores)
+        );
+        saveHighScoresForDifficulty(difficulty);
+        waitForAllControlsReleased();
+        return true;
+      }
+      else {
+        waitForAllControlsReleased();
+        return false;
+      }
+
+      drawHighScoreEditorScreen(difficulty, selectedItem);
+      previousUp = false;
+      previousDown = false;
+      previousGreen = false;
+      continue;
+    }
+
+    previousUp = up;
+    previousDown = down;
+    previousGreen = green;
     delay(5);
   }
 }
